@@ -66,13 +66,26 @@ from scipy.interpolate import splprep, splev
 
 
 # ----------------------------------------------------------------------
-# 画像処理コア  (検証済み: README_wire_curvature.md 参照。ロジックは不変)
+# 画像処理コア
 # ----------------------------------------------------------------------
-def wire_mask(img, roi, thr=150, blob=17, close=11, minarea=300):
-    """グレースケール閾値でワイヤ二値マスクを作る。roi=(x0,y0,x1,y1)"""
+def wire_stat(img, use_color=True):
+    """閾値化に使う単一チャネル統計量を返す。
+    use_color=True: 各画素の最小チャネル(min(B,G,R))。銀/白ワイヤは全チャネルが
+      高いので大きく、彩度の高い青背景は R が低いので小さい。→ 明暗ムラに強く、
+      暗いワイヤ部分も背景と分離できる(青背景×銀ワイヤに最適)。
+    use_color=False: 従来どおりのグレースケール輝度。"""
+    if use_color:
+        return img.min(axis=2).astype(np.uint8)
+    return cv2.cvtColor(img, cv2.COLOR_BGR2GRAY)
+
+
+def wire_mask(img, roi, thr=150, blob=17, close=11, minarea=300,
+              use_color=True):
+    """ワイヤ二値マスクを作る。roi=(x0,y0,x1,y1)
+    use_color で色分離(最小チャネル)/従来のグレースケールを切替。"""
     x0, y0, x1, y1 = roi
-    gray = cv2.cvtColor(img, cv2.COLOR_BGR2GRAY)
-    _, bw = cv2.threshold(gray, thr, 255, cv2.THRESH_BINARY)
+    stat = wire_stat(img, use_color)
+    _, bw = cv2.threshold(stat, thr, 255, cv2.THRESH_BINARY)
     m = np.zeros(img.shape[:2], np.uint8)
     m[y0:y1, x0:x1] = 255
     bw = cv2.bitwise_and(bw, m)
@@ -82,11 +95,12 @@ def wire_mask(img, roi, thr=150, blob=17, close=11, minarea=300):
         thick = cv2.dilate(cv2.morphologyEx(bw, cv2.MORPH_OPEN, k),
                            np.ones((5, 5), np.uint8))
         bw = cv2.bitwise_and(bw, cv2.bitwise_not(thick))
-    # 途切れをつなぐ
+    # 途切れをつなぐ: 膨張で断片を橋渡しする。細線は後段の skeletonize で
+    # 中心線化するので、太らせても中心線は保たれる。閉(close)より大きなギャップを
+    # 繋げられるので、断片化した細いワイヤの再結合に効く。
     if close and close >= 3:
-        bw = cv2.morphologyEx(
-            bw, cv2.MORPH_CLOSE,
-            cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (close, close)))
+        bw = cv2.dilate(
+            bw, cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (close, close)))
     # 最長(対角最大)の連結成分をワイヤとして採用
     n, lab, stats, _ = cv2.connectedComponentsWithStats(bw)
     best, bi = 0, -1
@@ -102,11 +116,8 @@ def wire_mask(img, roi, thr=150, blob=17, close=11, minarea=300):
     return (lab == bi).astype(np.uint8)
 
 
-def _order_skeleton(sk):
-    """スケルトン画素を最長パス(端点->端点)に沿って順序付け。(row,col)配列を返す"""
-    pts = np.column_stack(np.where(sk > 0))
-    if len(pts) < 5:
-        return None
+def _build_neighbors(pts):
+    """スケルトン画素の8近傍隣接リストを作る。"""
     idx = {tuple(p): i for i, p in enumerate(pts)}
     off = [(-1, -1), (-1, 0), (-1, 1), (0, -1),
            (0, 1), (1, -1), (1, 0), (1, 1)]
@@ -116,6 +127,45 @@ def _order_skeleton(sk):
             j = idx.get((r + dr, c + dc))
             if j is not None:
                 nb[i].append(j)
+    return nb
+
+
+def _walk_cycle(nb, start):
+    """端点の無い(閉じた)スケルトンを、隣接に沿って一周たどって順序付ける。
+    次数2を仮定した貪欲ウォーク。分岐で乱れたら None を返し呼び出し側で退避。"""
+    n = len(nb)
+    order = [start]
+    visited = {start}
+    prev, cur = -1, start
+    while True:
+        cand = [v for v in nb[cur] if v != prev]
+        unv = [v for v in cand if v not in visited]
+        if unv:
+            nxt = unv[0]
+        elif start in nb[cur] and len(order) > 3:
+            break                     # 一周して戻れた(閉ループ完成)
+        else:
+            break                     # 行き止まり/分岐で追跡不能
+        prev, cur = cur, nxt
+        order.append(cur)
+        visited.add(cur)
+        if len(order) > n:
+            break
+    # 過半数の画素をたどれていれば閉ループとして採用
+    if len(order) >= max(12, int(0.6 * n)):
+        return np.array(order)
+    return None
+
+
+def _order_skeleton(sk):
+    """スケルトン画素を中心線に沿って順序付ける。
+    返り値: (順序付き(row,col)配列, is_closed) / 失敗時 (None, False)
+    - 端点が2つ以上ある通常の弧: 端点間の最長パス(BFS×2)
+    - 端点が無い閉ループ: サイクルを一周たどる(周期スプライン用)"""
+    pts = np.column_stack(np.where(sk > 0))
+    if len(pts) < 5:
+        return None, False
+    nb = _build_neighbors(pts)
 
     def bfs(s):
         dist = {s: 0}
@@ -133,20 +183,30 @@ def _order_skeleton(sk):
                         far = v
         return far, dist, par
 
-    a, _, _ = bfs(0)
-    b, dist, par = bfs(a)          # a->b が最長パス
-    path = []
-    u = b
-    while u != -1:
-        path.append(u)
-        u = par[u]
-    return pts[path[::-1]]
+    def longest_path():
+        a, _, _ = bfs(0)
+        b, _, par = bfs(a)            # a->b が最長パス
+        path = []
+        u = b
+        while u != -1:
+            path.append(u)
+            u = par[u]
+        return pts[path[::-1]]
+
+    endpoints = [i for i in range(len(pts)) if len(nb[i]) == 1]
+    if len(endpoints) == 0:
+        # 端点なし = 閉ループ。まず一周たどる。失敗したら最長パスに退避。
+        ordered = _walk_cycle(nb, 0)
+        if ordered is not None:
+            return pts[ordered], True
+        return longest_path(), False
+    return longest_path(), False
 
 
 def curvature_of(mask, smooth_scale=2.0, npts=300):
     """マスク -> 中心線曲率。返り値 dict(x,y,kappa,s,total_len) 単位は px / 1/px"""
     sk = skeletonize(mask > 0)
-    ordered = _order_skeleton(sk.astype(np.uint8))
+    ordered, closed = _order_skeleton(sk.astype(np.uint8))
     if ordered is None or len(ordered) < 12:
         return None
     y = ordered[:, 0].astype(float)
@@ -156,10 +216,17 @@ def curvature_of(mask, smooth_scale=2.0, npts=300):
         return None
     s_par = d / d[-1]
     smooth = max(len(x) * float(smooth_scale), 1.0)
+    per = 1 if closed else 0
     try:
-        tck, _ = splprep([x, y], u=s_par, s=smooth, k=3)
+        tck, _ = splprep([x, y], u=s_par, s=smooth, k=3, per=per)
     except Exception:
-        return None
+        if per:                        # 周期スプラインが不調なら開曲線で再試行
+            try:
+                tck, _ = splprep([x, y], u=s_par, s=smooth, k=3, per=0)
+            except Exception:
+                return None
+        else:
+            return None
     uu = np.linspace(0, 1, npts)
     xs, ys = splev(uu, tck)
     dx, dy = splev(uu, tck, der=1)
@@ -168,7 +235,8 @@ def curvature_of(mask, smooth_scale=2.0, npts=300):
     denom[denom == 0] = np.nan
     kappa = np.abs(dx * ddy - dy * ddx) / denom      # 1/px
     s = np.r_[0, np.cumsum(np.hypot(np.diff(xs), np.diff(ys)))]  # px
-    return dict(x=xs, y=ys, kappa=kappa, s=s, total_len=s[-1])
+    return dict(x=xs, y=ys, kappa=kappa, s=s, total_len=s[-1],
+                closed=closed)
 
 
 # ----------------------------------------------------------------------
@@ -261,11 +329,19 @@ class App:
                         variable=self.v_preview,
                         command=self._on_preview_toggle).grid(
             row=r, column=0, columnspan=2, sticky="w"); r += 1
+        # 青背景を色で分離(細い/暗いワイヤの断片化に有効)
+        self.v_color = tk.BooleanVar(value=True)
+        ttk.Checkbutton(
+            p, text="青背景を色で分離(推奨: 細い銀ワイヤ)",
+            variable=self.v_color,
+            command=self._on_color_toggle).grid(
+            row=r, column=0, columnspan=2, sticky="w"); r += 1
 
         # 各種スライダ(分かりやすいラベル + 一行ヘルプ)
         self.v_thr = self._slider(
             p, "thr", "① 明るさしきい値", 0, 255, 150,
-            help="これより明るい画素をワイヤとみなす。ワイヤが消えるなら下げる")
+            help="これより明るい画素をワイヤとみなす。ワイヤが消えるなら下げる"
+                 "(色分離ON時は各画素の最小チャネルに対する閾値)")
         # 閾値の補助ボタン(自動 / クリック調整)
         rr = self._slider_next_row
         bf = ttk.Frame(p); bf.grid(row=rr, column=0, columnspan=2, sticky="ew"); r = rr + 1
@@ -648,7 +724,7 @@ class App:
         # --- ワイヤクリックで閾値調整 ---
         if self.pick_mode:
             cx, cy = int(ev.xdata), int(ev.ydata)
-            gray = cv2.cvtColor(self.frame, cv2.COLOR_BGR2GRAY)
+            gray = wire_stat(self.frame, self.v_color.get())
             H, W = gray.shape
             x0, x1 = max(0, cx - 4), min(W, cx + 5)
             y0, y1 = max(0, cy - 4), min(H, cy + 5)
@@ -784,11 +860,19 @@ class App:
             self._loupe_bg = None
 
     # -- 閾値自動 ----------------------------------------------------
-    def auto_threshold(self, quiet=False):
-        """ROI内(なければ全体)の輝度からOtsu閾値を求めてスライダに反映。"""
+    def _on_color_toggle(self):
+        """色分離ON/OFF切替。統計量が変わるので閾値を取り直してプレビュー更新。"""
         if self.frame is None:
             return
-        gray = cv2.cvtColor(self.frame, cv2.COLOR_BGR2GRAY)
+        self.auto_threshold(quiet=True)
+        self._schedule_preview()
+
+    def auto_threshold(self, quiet=False):
+        """ROI内(なければ全体)の統計量からOtsu閾値を求めてスライダに反映。
+        色分離ONなら最小チャネル、OFFならグレースケールに対して計算する。"""
+        if self.frame is None:
+            return
+        gray = wire_stat(self.frame, self.v_color.get())
         if self.roi:
             x0, y0, x1, y1 = self.roi
             sub = gray[y0:y1, x0:x1]
@@ -844,7 +928,8 @@ class App:
             mask = wire_mask(self.frame, self.roi,
                              thr=int(self.v_thr.get()),
                              blob=int(self.v_blob.get()),
-                             close=int(self.v_close.get()))
+                             close=int(self.v_close.get()),
+                             use_color=self.v_color.get())
         except Exception:
             return
         H, W = self.frame.shape[:2]
@@ -887,7 +972,8 @@ class App:
         mask = wire_mask(self.frame, self.roi,
                          thr=int(self.v_thr.get()),
                          blob=int(self.v_blob.get()),
-                         close=int(self.v_close.get()))
+                         close=int(self.v_close.get()),
+                         use_color=self.v_color.get())
         res = curvature_of(mask, smooth_scale=self.v_smooth.get() / 1000.0)
         if res is None:
             self.result = None
@@ -905,8 +991,11 @@ class App:
                    "→ ①明るさしきい値を下げる、または『ワイヤをクリックで調整』\n"
                    "→ ROIがワイヤを含んでいるか確認")
         elif n < 120:
+            hint = ("→ 『青背景を色で分離』をONにする(細い/暗いワイヤに有効)\n"
+                    if not self.v_color.get() else "")
             msg = ("⚠ 拾えた画素が少なすぎます(短い/細切れ)。\n"
                    f"  拾った画素={n}\n"
+                   + hint +
                    "→ ②太い部分を消す を下げる(ワイヤまで消えている可能性)\n"
                    "→ ③線をつなぐ を上げて断片を橋渡し")
         else:
@@ -1144,6 +1233,7 @@ class App:
             return
         thr = int(self.v_thr.get()); blob = int(self.v_blob.get())
         close = int(self.v_close.get()); sm = self.v_smooth.get() / 1000.0
+        use_color = self.v_color.get()
         rows = []
         idxs = range(0, self.nframes, step)
         self._log(f"一括解析中… ({len(list(idxs))}フレーム)")
@@ -1153,7 +1243,8 @@ class App:
             ok, fr = self.cap.read()
             if not ok:
                 continue
-            m = wire_mask(fr, self.roi, thr=thr, blob=blob, close=close)
+            m = wire_mask(fr, self.roi, thr=thr, blob=blob, close=close,
+                          use_color=use_color)
             r = curvature_of(m, smooth_scale=sm)
             if r is None:
                 continue
