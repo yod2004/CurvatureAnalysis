@@ -366,6 +366,15 @@ class App:
         ttk.Button(p, text="解析 (このフレーム)", command=self.analyze).grid(
             row=r, column=0, columnspan=2, sticky="ew", pady=(8, 2)); r += 1
 
+        # グラフの縦軸: 曲率κ / 曲率半径R の切替
+        gf = ttk.Frame(p); gf.grid(row=r, column=0, columnspan=2, sticky="w"); r += 1
+        ttk.Label(gf, text="グラフ:").pack(side="left")
+        self.v_radius = tk.BooleanVar(value=False)
+        ttk.Radiobutton(gf, text="曲率 κ", variable=self.v_radius, value=False,
+                        command=self._on_metric_toggle).pack(side="left")
+        ttk.Radiobutton(gf, text="曲率半径 R", variable=self.v_radius, value=True,
+                        command=self._on_metric_toggle).pack(side="left")
+
         # ROI
         rf = ttk.Frame(p); rf.grid(row=r, column=0, columnspan=2, sticky="ew"); r += 1
         ttk.Label(rf, text="ROI: 画像上をドラッグ", foreground="#555").pack(side="left")
@@ -1021,18 +1030,52 @@ class App:
             m = np.ones_like(res["s"], dtype=bool)
         return m
 
+    def _on_metric_toggle(self):
+        """κ ↔ R 表示切替。解析結果があれば描き直す。"""
+        if self.result is not None:
+            self._plot()
+            self._report()
+
+    def _metric_disp(self, res):
+        """表示モード(κ/R)に応じた値配列と単位ラベルを返す。
+        返り値: (値配列, 名前, 単位, is_radius)。px_per_mm があれば実寸単位。"""
+        k = res["kappa"]
+        if self.v_radius.get():
+            with np.errstate(divide="ignore", invalid="ignore"):
+                R = 1.0 / k                       # 曲率半径 R = 1/κ [px]
+            if self.px_per_mm:
+                return R / self.px_per_mm, "R", "mm", True
+            return R, "R", "px", True
+        if self.px_per_mm:
+            return k * self.px_per_mm, "κ", "1/mm", False
+        return k, "κ", "1/px", False
+
+    @staticmethod
+    def _disp_limits(vals, is_radius):
+        """カラースケール/縦軸の頑健な範囲を返す(外れ値でスケールが潰れないよう)。
+        R は直線部で発散するので上側をパーセンタイルで抑える。"""
+        v = vals[np.isfinite(vals)]
+        if v.size == 0:
+            return 0.0, 1.0
+        if is_radius:
+            lo = float(np.nanpercentile(v, 5))
+            hi = float(np.nanpercentile(v, 95))
+            if not np.isfinite(hi) or hi <= 0:
+                hi = float(np.nanmax(v))
+            lo = max(0.0, lo if np.isfinite(lo) else 0.0)
+            if hi <= lo:
+                hi = lo + 1.0
+            return lo, hi
+        hi = float(np.nanpercentile(v, 97))
+        if not np.isfinite(hi) or hi <= 0:
+            hi = float(np.nanmax(v)) or 1.0
+        return 0.0, hi
+
     def _plot(self):
         res = self.result
-        if self.px_per_mm:
-            k_disp = res["kappa"] * self.px_per_mm
-            ku = "1/mm"
-        else:
-            k_disp = res["kappa"]
-            ku = "1/px"
+        v_disp, name, unit, is_r = self._metric_disp(res)
         inc = self._inc_mask(res)
-        kmax = np.nanpercentile(k_disp[inc], 97)
-        if not np.isfinite(kmax) or kmax <= 0:
-            kmax = np.nanpercentile(k_disp, 97)
+        vmin, vmax = self._disp_limits(v_disp[inc], is_r)
 
         # 画像 + カラー中心線(除外部は薄い灰色)
         self.ax_img.clear()
@@ -1041,65 +1084,62 @@ class App:
         if (~inc).any():
             self.ax_img.scatter(res["x"][~inc], res["y"][~inc],
                                 c="0.7", s=5, alpha=0.5)
-        sc = self.ax_img.scatter(res["x"][inc], res["y"][inc], c=k_disp[inc],
-                                 cmap="jet", s=7, vmin=0, vmax=kmax)
+        # R は「小さい=急な曲がり」を目立たせたいので反転カラーマップ
+        cmap = "jet_r" if is_r else "jet"
+        sc = self.ax_img.scatter(res["x"][inc], res["y"][inc], c=v_disp[inc],
+                                 cmap=cmap, s=7, vmin=vmin, vmax=vmax)
         x0, y0, x1, y1 = self.roi
         self.ax_img.set_xlim(x0 - 10, x1 + 10)
         self.ax_img.set_ylim(y1 + 10, y0 - 10)
-        self.ax_img.set_title(f"中心線 曲率カラー  (R中央値="
+        label = "曲率半径" if is_r else "曲率"
+        self.ax_img.set_title(f"中心線 {label}カラー  (R中央値="
                               f"{self._Rmed_str()})")
         # 固定枠(cax)にカラーバーを描き直す。ax_img のサイズは変わらない
         self.cax.set_visible(True)
         self.cax.cla()
-        self.cbar = self.fig.colorbar(sc, cax=self.cax, label=f"kappa [{ku}]")
+        self.cbar = self.fig.colorbar(sc, cax=self.cax,
+                                      label=f"{name} [{unit}]")
         self._draw_roi_rect()
 
         self._draw_kappa()
         self.canvas.draw_idle()
 
     def _draw_kappa(self):
-        """下段の曲率分布を描画(トリム縦棒・除外シェード・中央値・縦軸を反映)。
+        """下段の分布(κ または R)を描画(トリム縦棒・除外シェード・中央値・縦軸を反映)。
         ドラッグ中はここだけ呼んで軽く追従させる。"""
         res = self.result
         if res is None:
             return
-        if self.px_per_mm:
-            k_disp = res["kappa"] * self.px_per_mm
-            s_disp = res["s"] / self.px_per_mm
-            ku, su = "1/mm", "mm"
-        else:
-            k_disp = res["kappa"]
-            s_disp = res["s"]
-            ku, su = "1/px", "px"
+        v_disp, name, unit, is_r = self._metric_disp(res)
+        s_disp = res["s"] / self.px_per_mm if self.px_per_mm else res["s"]
+        su = "mm" if self.px_per_mm else "px"
         inc = self._inc_mask(res)
-        kmax = np.nanpercentile(k_disp[inc], 97)
-        if not np.isfinite(kmax) or kmax <= 0:
-            kmax = np.nanpercentile(k_disp, 97)
+        _, vmax = self._disp_limits(v_disp[inc], is_r)
         total = s_disp[-1]
         lo_d, hi_d = self.s_lo_frac * total, self.s_hi_frac * total
 
         self.ax_k.clear()
         # 全体は薄灰、採用区間だけ濃い青で強調
-        self.ax_k.plot(s_disp, k_disp, color="0.75", lw=1.0)
-        self.ax_k.plot(s_disp[inc], k_disp[inc], "b-", lw=1.7)
+        self.ax_k.plot(s_disp, v_disp, color="0.75", lw=1.0)
+        self.ax_k.plot(s_disp[inc], v_disp[inc], "b-", lw=1.7)
         if self.s_lo_frac > 0:
             self.ax_k.axvspan(s_disp[0], lo_d, color="0.5", alpha=0.15)
         if self.s_hi_frac < 1:
             self.ax_k.axvspan(hi_d, s_disp[-1], color="0.5", alpha=0.15)
-        med = np.nanmedian(k_disp[inc])
+        med = np.nanmedian(v_disp[inc])
         self.ax_k.axhline(med, color="r", ls="--",
-                          label=f"中央値={med:.4g} {ku}")
+                          label=f"中央値={med:.4g} {unit}")
         # ドラッグ可能な緑の縦棒(左右)
         l_lo = self.ax_k.axvline(lo_d, color="#0a0", lw=2.2, alpha=0.9)
         l_hi = self.ax_k.axvline(hi_d, color="#0a0", lw=2.2, alpha=0.9)
         self._trim_lines = [l_lo, l_hi]
         self.ax_k.set_xlabel(
             f"弧長 s [{su}]  — 緑の縦棒をドラッグで範囲指定 / ダブルクリックで全域")
-        self.ax_k.set_ylabel(f"kappa [{ku}]")
-        self.ax_k.set_ylim(0, kmax * 1.3)
+        self.ax_k.set_ylabel(f"{name} [{unit}]")
+        self.ax_k.set_ylim(0, vmax * 1.3)
         self.ax_k.grid(alpha=0.3)
         self.ax_k.legend(loc="upper right")
-        self.ax_k.set_title("局所曲率分布")
+        self.ax_k.set_title("局所曲率半径 R(s)" if is_r else "局所曲率 κ(s)")
 
     # -- 縦棒ドラッグ ------------------------------------------------
     def _on_trim_press(self, ev):
@@ -1275,22 +1315,31 @@ class App:
                    delimiter=",",
                    header=f"frame,time_s,arclength_{lu},kappa_med_{ku},R_med_{ru}",
                    comments="", fmt="%.6g")
-        # グラフ
+        # グラフ(上段は κ/R トグルに追従。CSVは常に両方を保存)
+        is_r = self.v_radius.get()
+        y_top = R if is_r else kappa
+        yl_top = f"R中央値 [{ru}]" if is_r else f"κ中央値 [{ku}]"
+        ti_top = ("送り(時間)に対する中央曲率半径" if is_r
+                  else "送り(時間)に対する中央曲率")
         win = tk.Toplevel(self.root)
-        win.title("時系列: 曲率と弧長")
+        win.title("時系列: 曲率半径と弧長" if is_r else "時系列: 曲率と弧長")
         fig = Figure(figsize=(8, 6))
         a1 = fig.add_subplot(2, 1, 1)
-        a1.plot(arr[:, 1], kappa, "o-", ms=3)
-        a1.set_ylabel(f"κ中央値 [{ku}]"); a1.grid(alpha=.3)
-        a1.set_title("送り(時間)に対する中央曲率")
+        a1.plot(arr[:, 1], y_top, "o-", ms=3)
+        a1.set_ylabel(yl_top); a1.grid(alpha=.3)
+        a1.set_title(ti_top)
         a2 = fig.add_subplot(2, 1, 2)
         a2.plot(arr[:, 1], length, "s-", ms=3, color="green")
         a2.set_xlabel("時間 [s]"); a2.set_ylabel(f"弧長 [{lu}]")
         a2.grid(alpha=.3)
         fig.tight_layout()
         FigureCanvasTkAgg(fig, master=win).get_tk_widget().pack(fill="both", expand=True)
-        self._log(f"一括解析完了: {len(rows)}点\n保存: {os.path.basename(out)}\n"
-                  f"κ中央値 平均={np.nanmean(kappa):.4g} {ku}")
+        if is_r:
+            self._log(f"一括解析完了: {len(rows)}点\n保存: {os.path.basename(out)}\n"
+                      f"R中央値 平均={np.nanmean(R):.4g} {ru}")
+        else:
+            self._log(f"一括解析完了: {len(rows)}点\n保存: {os.path.basename(out)}\n"
+                      f"κ中央値 平均={np.nanmean(kappa):.4g} {ku}")
 
     # -- util --------------------------------------------------------
     def _log(self, msg):
