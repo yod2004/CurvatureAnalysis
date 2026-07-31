@@ -233,7 +233,9 @@ def curvature_of(mask, smooth_scale=2.0, npts=300):
     ddx, ddy = splev(uu, tck, der=2)
     denom = np.power(dx * dx + dy * dy, 1.5)
     denom[denom == 0] = np.nan
-    kappa = np.abs(dx * ddy - dy * ddx) / denom      # 1/px
+    # 符号付き曲率(絶対値を取らない)。符号は曲がる向きを表す。
+    # 表示側で絶対値/符号付きを切替できる(App._kappa_signed)。
+    kappa = (dx * ddy - dy * ddx) / denom            # 1/px (signed)
     s = np.r_[0, np.cumsum(np.hypot(np.diff(xs), np.diff(ys)))]  # px
     return dict(x=xs, y=ys, kappa=kappa, s=s, total_len=s[-1],
                 closed=closed)
@@ -374,6 +376,11 @@ class App:
                         command=self._on_metric_toggle).pack(side="left")
         ttk.Radiobutton(gf, text="曲率半径 R", variable=self.v_radius, value=True,
                         command=self._on_metric_toggle).pack(side="left")
+        # 符号付き(±): 負の曲率(曲がる向き)も表示する
+        self.v_signed = tk.BooleanVar(value=True)
+        ttk.Checkbutton(gf, text="符号付き(±)", variable=self.v_signed,
+                        command=self._on_metric_toggle).pack(side="left",
+                                                             padx=(8, 0))
 
         # ROI
         rf = ttk.Frame(p); rf.grid(row=r, column=0, columnspan=2, sticky="ew"); r += 1
@@ -1036,13 +1043,19 @@ class App:
             self._plot()
             self._report()
 
+    def _kappa_signed(self, res):
+        """符号付きトグルに応じた曲率配列を返す(OFFなら絶対値)。"""
+        k = res["kappa"]
+        return k if self.v_signed.get() else np.abs(k)
+
     def _metric_disp(self, res):
         """表示モード(κ/R)に応じた値配列と単位ラベルを返す。
-        返り値: (値配列, 名前, 単位, is_radius)。px_per_mm があれば実寸単位。"""
-        k = res["kappa"]
+        返り値: (値配列, 名前, 単位, is_radius)。px_per_mm があれば実寸単位。
+        符号付きモードでは負値(曲がる向き)も保持する。"""
+        k = self._kappa_signed(res)
         if self.v_radius.get():
             with np.errstate(divide="ignore", invalid="ignore"):
-                R = 1.0 / k                       # 曲率半径 R = 1/κ [px]
+                R = 1.0 / k                       # 曲率半径 R = 1/κ [px](符号継承)
             if self.px_per_mm:
                 return R / self.px_per_mm, "R", "mm", True
             return R, "R", "px", True
@@ -1053,22 +1066,20 @@ class App:
     @staticmethod
     def _disp_limits(vals, is_radius):
         """カラースケール/縦軸の頑健な範囲を返す(外れ値でスケールが潰れないよう)。
-        R は直線部で発散するので上側をパーセンタイルで抑える。"""
+        両符号あれば 0 を中心とした対称範囲。R は直線部で発散するので
+        絶対値のパーセンタイルで上限を抑える。"""
         v = vals[np.isfinite(vals)]
         if v.size == 0:
             return 0.0, 1.0
-        if is_radius:
-            lo = float(np.nanpercentile(v, 5))
-            hi = float(np.nanpercentile(v, 95))
-            if not np.isfinite(hi) or hi <= 0:
-                hi = float(np.nanmax(v))
-            lo = max(0.0, lo if np.isfinite(lo) else 0.0)
-            if hi <= lo:
-                hi = lo + 1.0
-            return lo, hi
-        hi = float(np.nanpercentile(v, 97))
+        pct = 95 if is_radius else 97
+        hi = float(np.nanpercentile(np.abs(v), pct))
         if not np.isfinite(hi) or hi <= 0:
-            hi = float(np.nanmax(v)) or 1.0
+            hi = float(np.nanmax(np.abs(v))) or 1.0
+        neg, pos = bool(np.any(v < 0)), bool(np.any(v > 0))
+        if neg and pos:
+            return -hi, hi          # 両符号 → 0中心の対称スケール
+        if neg:
+            return -hi, 0.0
         return 0.0, hi
 
     def _plot(self):
@@ -1084,8 +1095,12 @@ class App:
         if (~inc).any():
             self.ax_img.scatter(res["x"][~inc], res["y"][~inc],
                                 c="0.7", s=5, alpha=0.5)
-        # R は「小さい=急な曲がり」を目立たせたいので反転カラーマップ
-        cmap = "jet_r" if is_r else "jet"
+        # 両符号(0中心)なら発散カラーマップ、片符号なら従来の連続カラーマップ
+        # (R は「小さい=急な曲がり」を目立たせたいので反転)
+        if vmin < 0 < vmax:
+            cmap = "coolwarm"
+        else:
+            cmap = "jet_r" if is_r else "jet"
         sc = self.ax_img.scatter(res["x"][inc], res["y"][inc], c=v_disp[inc],
                                  cmap=cmap, s=7, vmin=vmin, vmax=vmax)
         x0, y0, x1, y1 = self.roi
@@ -1114,11 +1129,14 @@ class App:
         s_disp = res["s"] / self.px_per_mm if self.px_per_mm else res["s"]
         su = "mm" if self.px_per_mm else "px"
         inc = self._inc_mask(res)
-        _, vmax = self._disp_limits(v_disp[inc], is_r)
+        vmin, vmax = self._disp_limits(v_disp[inc], is_r)
         total = s_disp[-1]
         lo_d, hi_d = self.s_lo_frac * total, self.s_hi_frac * total
 
         self.ax_k.clear()
+        # 両符号なら 0 の基準線を引く
+        if vmin < 0 < vmax:
+            self.ax_k.axhline(0, color="0.4", lw=0.8)
         # 全体は薄灰、採用区間だけ濃い青で強調
         self.ax_k.plot(s_disp, v_disp, color="0.75", lw=1.0)
         self.ax_k.plot(s_disp[inc], v_disp[inc], "b-", lw=1.7)
@@ -1136,7 +1154,12 @@ class App:
         self.ax_k.set_xlabel(
             f"弧長 s [{su}]  — 緑の縦棒をドラッグで範囲指定 / ダブルクリックで全域")
         self.ax_k.set_ylabel(f"{name} [{unit}]")
-        self.ax_k.set_ylim(0, vmax * 1.3)
+        # 縦軸範囲: 符号に応じて 0 中心 / 片側
+        ylo = vmin * 1.3 if vmin < 0 else 0.0
+        yhi = vmax * 1.3 if vmax > 0 else 0.0
+        if yhi <= ylo:
+            yhi = ylo + 1.0
+        self.ax_k.set_ylim(ylo, yhi)
         self.ax_k.grid(alpha=0.3)
         self.ax_k.legend(loc="upper right")
         self.ax_k.set_title("局所曲率半径 R(s)" if is_r else "局所曲率 κ(s)")
@@ -1185,7 +1208,7 @@ class App:
     def _Rmed_str(self):
         res = self.result
         inc = self._inc_mask(res)
-        Rpx = 1.0 / np.nanmedian(res["kappa"][inc])
+        Rpx = 1.0 / np.nanmedian(self._kappa_signed(res)[inc])
         if self.px_per_mm:
             return f"{Rpx/self.px_per_mm:.2f} mm"
         return f"{Rpx:.1f} px"
@@ -1193,7 +1216,7 @@ class App:
     def _report(self):
         res = self.result
         inc = self._inc_mask(res)
-        k = res["kappa"][inc]
+        k = self._kappa_signed(res)[inc]
         kmed = np.nanmedian(k)
         kmean = np.nanmean(k)
         Rpx = 1.0 / kmed
@@ -1234,9 +1257,10 @@ class App:
             initialfile=f"curvature_frame{self.cur_index}.csv")
         if not path:
             return
+        ks = self._kappa_signed(res)             # 符号付き/絶対値トグルを反映
         if self.px_per_mm:
             s = res["s"] / self.px_per_mm
-            k = res["kappa"] * self.px_per_mm
+            k = ks * self.px_per_mm
             xmm = res["x"] / self.px_per_mm
             ymm = res["y"] / self.px_per_mm
             hdr = "s_mm,x_mm,y_mm,kappa_1permm,R_mm"
@@ -1244,7 +1268,7 @@ class App:
         else:
             hdr = "s_px,x_px,y_px,kappa_1perpx,R_px"
             data = np.column_stack([res["s"], res["x"], res["y"],
-                                    res["kappa"], 1.0 / res["kappa"]])
+                                    ks, 1.0 / ks])
         np.savetxt(path, data, delimiter=",", header=hdr, comments="",
                    fmt="%.6g")
         self._log(f"CSV保存: {os.path.basename(path)}")
@@ -1292,7 +1316,7 @@ class App:
             inc = self._inc_mask(r)
             s_inc = r["s"][inc]
             seg_len = float(s_inc[-1] - s_inc[0])
-            kmed = float(np.nanmedian(r["kappa"][inc]))
+            kmed = float(np.nanmedian(self._kappa_signed(r)[inc]))
             rows.append((i, i / self.fps, seg_len, kmed, 1.0 / kmed))
         self.cap.set(cv2.CAP_PROP_POS_FRAMES, self.cur_index)
         self.cap.read()
