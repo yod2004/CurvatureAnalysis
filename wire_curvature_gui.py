@@ -381,6 +381,16 @@ class App:
         ttk.Checkbutton(gf, text="符号付き(±)", variable=self.v_signed,
                         command=self._on_metric_toggle).pack(side="left",
                                                              padx=(8, 0))
+        # 図のレイアウト: 縦並び / 横並び(縦長画像で図が大きく見やすくなる)
+        lf = ttk.Frame(p); lf.grid(row=r, column=0, columnspan=2, sticky="w"); r += 1
+        ttk.Label(lf, text="レイアウト:").pack(side="left")
+        self.v_layout = tk.StringVar(value="stacked")
+        ttk.Radiobutton(lf, text="縦並び", variable=self.v_layout,
+                        value="stacked",
+                        command=self._on_layout_change).pack(side="left")
+        ttk.Radiobutton(lf, text="横並び(縦長向き)", variable=self.v_layout,
+                        value="side",
+                        command=self._on_layout_change).pack(side="left")
 
         # ROI
         rf = ttk.Frame(p); rf.grid(row=r, column=0, columnspan=2, sticky="ew"); r += 1
@@ -492,36 +502,81 @@ class App:
         self.root.columnconfigure(1, weight=1)
         self.root.rowconfigure(0, weight=1)
 
-        # 縦2段(上=画像, 下=曲率)。カラーバーは上段の右に「固定枠(cax)」として
-        # 最初に1つだけ確保する。毎回 colorbar(ax=...) で作り直すと親軸から場所を
-        # 奪って画像が操作のたびに縮むため、以後は cax に描き直して縮小を防ぐ。
-        self.fig = Figure(figsize=(11, 8))
-        gs = self.fig.add_gridspec(2, 2, width_ratios=[1, 0.035],
-                                   height_ratios=[1, 1], wspace=0.03, hspace=0.28)
-        self.ax_img = self.fig.add_subplot(gs[0, 0])
-        self.cax = self.fig.add_subplot(gs[0, 1])   # カラーバー専用の固定枠
-        self.cax.set_visible(False)
-        self.ax_k = self.fig.add_subplot(gs[1, :])
-        self.ax_img.set_title("画像 + 抽出マスク(赤)  — ドラッグでROI指定")
-        self.ax_k.set_title("局所曲率分布")
+        self.fig = Figure(figsize=(12, 8))
         self.cbar = None
         self.canvas = FigureCanvasTkAgg(self.fig, master=f)
         self.canvas.get_tk_widget().pack(fill="both", expand=True)
-        # tight_layout はカラーバーと相性が悪く再描画で軸が動くので使わない
-        self.fig.subplots_adjust(left=0.07, right=0.92, top=0.94, bottom=0.08)
-
-        # ROI 選択
-        self.selector = RectangleSelector(
-            self.ax_img, self._on_roi, useblit=True, button=[1],
-            minspanx=10, minspany=10, spancoords="pixels", interactive=True)
-        # 校正 / クリック調整
+        # イベント接続は一度きり(軸を張り替えてもハンドラは self.ax_* を都度参照)
         self.canvas.mpl_connect("button_press_event", self._on_click)
-        # 校正中はカーソル周辺を拡大鏡(ルーペ)で表示
         self.canvas.mpl_connect("motion_notify_event", self._on_calib_motion)
-        # 下グラフ(曲率)の縦棒トリム: 掴む/動かす/離す + ダブルクリックで全域リセット
         self.canvas.mpl_connect("button_press_event", self._on_trim_press)
         self.canvas.mpl_connect("motion_notify_event", self._on_trim_motion)
         self.canvas.mpl_connect("button_release_event", self._on_trim_release)
+        # 実際の軸配置(縦並び/横並び)を構築
+        self._layout_axes()
+
+    def _layout_axes(self):
+        """現在の self.v_layout に従って軸を(再)構築する。
+        縦並び(stacked): 上=画像+カラーバー, 下=曲率グラフ。
+        横並び(side): 左=画像+カラーバー, 右=曲率グラフ(縦長画像で無駄な余白を解消)。
+        カラーバーは専用の固定枠(cax)に描き、操作のたびに画像が縮むのを防ぐ。"""
+        self.fig.clf()
+        if getattr(self, "v_layout", None) is not None and \
+                self.v_layout.get() == "side":
+            # 画像 / カラーバー / スペーサ(y軸ラベル用) / グラフ
+            gs = self.fig.add_gridspec(
+                1, 4, width_ratios=[0.5, 0.03, 0.11, 1.0], wspace=0.04)
+            self.ax_img = self.fig.add_subplot(gs[0, 0])
+            self.cax = self.fig.add_subplot(gs[0, 1])
+            self.ax_k = self.fig.add_subplot(gs[0, 3])
+            self.fig.subplots_adjust(left=0.045, right=0.965, top=0.93,
+                                     bottom=0.10)
+        else:
+            gs = self.fig.add_gridspec(2, 2, width_ratios=[1, 0.035],
+                                       height_ratios=[1, 1],
+                                       wspace=0.03, hspace=0.28)
+            self.ax_img = self.fig.add_subplot(gs[0, 0])
+            self.cax = self.fig.add_subplot(gs[0, 1])
+            self.ax_k = self.fig.add_subplot(gs[1, :])
+            self.fig.subplots_adjust(left=0.07, right=0.92, top=0.94,
+                                     bottom=0.08)
+        self.cax.set_visible(False)
+        self.ax_img.set_title("画像 + 抽出マスク(赤)  — ドラッグでROI指定")
+        self.ax_k.set_title("局所曲率分布")
+        self.cbar = None
+        # clf で消えた重ね描き/ルーペ関連の参照をリセット
+        self._img_artist = None
+        self._overlay_artist = None
+        self._loupe_ax = None
+        self._loupe_bg = None
+        # ROI 選択を新しい軸に張り直す
+        self.selector = RectangleSelector(
+            self.ax_img, self._on_roi, useblit=True, button=[1],
+            minspanx=10, minspany=10, spancoords="pixels", interactive=True)
+        # 現在の内容を再描画
+        if getattr(self, "result", None) is not None:
+            self._plot()
+        elif getattr(self, "frame", None) is not None:
+            self.show_frame()
+            self.update_preview()
+        else:
+            self.canvas.draw_idle()
+
+    def _on_layout_change(self):
+        """レイアウト(縦並び/横並び)切替。軸を張り替えて再描画。"""
+        self._layout_axes()
+
+    def _auto_layout(self):
+        """読み込み時、ROI の縦横比でレイアウトを自動選択(縦長→横並び)。
+        手動切替を上書きしないよう、値が変わるときだけ張り替える。"""
+        if self.roi is None:
+            return
+        x0, y0, x1, y1 = self.roi
+        w, h = max(1, x1 - x0), max(1, y1 - y0)
+        want = "side" if h > 1.8 * w else "stacked"
+        if self.v_layout.get() != want:
+            self.v_layout.set(want)
+            self._layout_axes()
 
     # -- 動画 --------------------------------------------------------
     def on_open(self):
@@ -576,6 +631,7 @@ class App:
         # ROI内の輝度から閾値を自動初期化
         self.auto_threshold(quiet=True)
         self.update_preview()
+        self._auto_layout()            # 縦長ならレイアウトを横並びに自動切替
         self._log(f"画像読み込み: {os.path.basename(path)}\n"
                   f"{W}x{H}\n"
                   f"閾値を自動設定しました。赤マスクを見ながら微調整を。")
@@ -601,6 +657,7 @@ class App:
         # ROI内の輝度から閾値を自動初期化(勘値からの脱却)
         self.auto_threshold(quiet=True)
         self.update_preview()
+        self._auto_layout()            # 縦長ならレイアウトを横並びに自動切替
         self._log(f"読み込み: {os.path.basename(path)}\n"
                   f"{W}x{H}, {self.nframes}フレーム, {self.fps:.1f}fps\n"
                   f"閾値を自動設定しました。赤マスクを見ながら微調整を。")
@@ -1160,6 +1217,16 @@ class App:
         if yhi <= ylo:
             yhi = ylo + 1.0
         self.ax_k.set_ylim(ylo, yhi)
+        # 横軸範囲: トリム済みなら採用区間にズーム(端の長い直線区間で
+        # 肝心の曲がりが潰れるのを防ぐ)。ドラッグ中は全体を出して位置決めしやすく。
+        trimmed = self.s_lo_frac > 0 or self.s_hi_frac < 1
+        if trimmed and self._drag_idx is None:
+            span = max(hi_d - lo_d, 1e-6)
+            pad = 0.10 * span            # 縦棒を掴む余白 + 少しの文脈
+            self.ax_k.set_xlim(max(s_disp[0], lo_d - pad),
+                               min(s_disp[-1], hi_d + pad))
+        else:
+            self.ax_k.set_xlim(s_disp[0], s_disp[-1])
         self.ax_k.grid(alpha=0.3)
         self.ax_k.legend(loc="upper right")
         self.ax_k.set_title("局所曲率半径 R(s)" if is_r else "局所曲率 κ(s)")
