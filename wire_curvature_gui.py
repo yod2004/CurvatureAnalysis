@@ -68,23 +68,32 @@ from scipy.interpolate import splprep, splev
 # ----------------------------------------------------------------------
 # 画像処理コア
 # ----------------------------------------------------------------------
-def wire_stat(img, use_color=True):
+def wire_stat(img, use_color=True, blur=0):
     """閾値化に使う単一チャネル統計量を返す。
     use_color=True: 各画素の最小チャネル(min(B,G,R))。銀/白ワイヤは全チャネルが
       高いので大きく、彩度の高い青背景は R が低いので小さい。→ 明暗ムラに強く、
       暗いワイヤ部分も背景と分離できる(青背景×銀ワイヤに最適)。
-    use_color=False: 従来どおりのグレースケール輝度。"""
+    use_color=False: 従来どおりのグレースケール輝度。
+    blur>=1: 閾値化の前にガウシアンぼかし(半径 blur px, カーネル 2*blur+1)。
+      光沢ワイヤの片側ハイライトや縁のギザギザを融合・平滑化し、二値化した帯を
+      左右対称の中実帯に近づける → skeletonize が真の中心を通りやすくなる。"""
     if use_color:
-        return img.min(axis=2).astype(np.uint8)
-    return cv2.cvtColor(img, cv2.COLOR_BGR2GRAY)
+        s = img.min(axis=2).astype(np.uint8)
+    else:
+        s = cv2.cvtColor(img, cv2.COLOR_BGR2GRAY)
+    if blur and blur >= 1:
+        k = int(blur) * 2 + 1
+        s = cv2.GaussianBlur(s, (k, k), 0)
+    return s
 
 
 def wire_mask(img, roi, thr=150, blob=17, close=11, minarea=300,
-              use_color=True):
+              use_color=True, blur=0):
     """ワイヤ二値マスクを作る。roi=(x0,y0,x1,y1)
-    use_color で色分離(最小チャネル)/従来のグレースケールを切替。"""
+    use_color で色分離(最小チャネル)/従来のグレースケールを切替。
+    blur で閾値化前のガウシアンぼかし(中心化)。"""
     x0, y0, x1, y1 = roi
-    stat = wire_stat(img, use_color)
+    stat = wire_stat(img, use_color, blur)
     _, bw = cv2.threshold(stat, thr, 255, cv2.THRESH_BINARY)
     m = np.zeros(img.shape[:2], np.uint8)
     m[y0:y1, x0:x1] = 255
@@ -130,6 +139,46 @@ def _build_neighbors(pts):
     return nb
 
 
+def _prune_spurs(pts, nb, min_len=12):
+    """短い枝(スパー)を刈る。ワイヤ先端の平坦端で skeleton が Y字に割れたり、
+    縁のノイズで生じる短い横枝は、端の曲率を歪める。端点から辿って分岐点(次数≥3)
+    に達する枝の長さが min_len 未満ならその枝を除去する。ワイヤ本体は分岐点を
+    持たない単純パスなので、min_len に関係なく除去されない(安全)。
+    返り値: 生き残った画素だけの pts(順序は元のまま)。"""
+    alive = [True] * len(pts)
+
+    def deg(i):
+        return sum(alive[v] for v in nb[i])
+
+    changed = True
+    while changed:
+        changed = False
+        for i in range(len(pts)):
+            if not alive[i] or deg(i) != 1:
+                continue
+            # 端点 i から枝をたどる
+            branch = [i]
+            prev, cur = -1, i
+            while True:
+                nxts = [v for v in nb[cur] if alive[v] and v != prev]
+                if len(nxts) != 1:
+                    break                 # 分岐点(≥2)か行き止まり(0)に到達
+                nxt = nxts[0]
+                if deg(nxt) >= 3:
+                    cur = nxt
+                    break                 # 次が分岐点。枝はここまで(分岐点は残す)
+                prev, cur = cur, nxt
+                branch.append(cur)
+            if deg(cur) >= 3 and len(branch) < min_len:
+                for b in branch:
+                    alive[b] = False
+                changed = True
+    keep = [i for i in range(len(pts)) if alive[i]]
+    if len(keep) == len(pts) or len(keep) < 5:
+        return pts
+    return pts[keep]
+
+
 def _walk_cycle(nb, start):
     """端点の無い(閉じた)スケルトンを、隣接に沿って一周たどって順序付ける。
     次数2を仮定した貪欲ウォーク。分岐で乱れたら None を返し呼び出し側で退避。"""
@@ -166,6 +215,13 @@ def _order_skeleton(sk):
     if len(pts) < 5:
         return None, False
     nb = _build_neighbors(pts)
+    # 短い枝(先端の割れ・縁ノイズ)を刈って中心線を1本に整える
+    pruned = _prune_spurs(pts, nb)
+    if len(pruned) != len(pts):
+        pts = pruned
+        nb = _build_neighbors(pts)
+        if len(pts) < 5:
+            return None, False
 
     def bfs(s):
         dist = {s: 0}
@@ -363,6 +419,11 @@ class App:
             p, "smooth", "④ なめらかさ", 100, 8000, 2000,
             help="曲率のノイズ抑制。ガタつくなら上げ、鈍るなら下げる",
             scale=0.001, step=50)
+        self.v_blur = self._slider(
+            p, "blur", "⑤ 中心化ぼかし", 0, 12, 0,
+            help="0で無効。閾値化の前にぼかし、光沢の片側ハイライトや縁の"
+                 "ギザギザを融合→中心線が真ん中を通りやすくなる。縁が拾われて"
+                 "トレースがズレるとき1〜4程度から上げる")
         r = self._slider_next_row
 
         ttk.Button(p, text="解析 (このフレーム)", command=self.analyze).grid(
@@ -797,7 +858,8 @@ class App:
         # --- ワイヤクリックで閾値調整 ---
         if self.pick_mode:
             cx, cy = int(ev.xdata), int(ev.ydata)
-            gray = wire_stat(self.frame, self.v_color.get())
+            gray = wire_stat(self.frame, self.v_color.get(),
+                             int(self.v_blur.get()))
             H, W = gray.shape
             x0, x1 = max(0, cx - 4), min(W, cx + 5)
             y0, y1 = max(0, cy - 4), min(H, cy + 5)
@@ -945,7 +1007,7 @@ class App:
         色分離ONなら最小チャネル、OFFならグレースケールに対して計算する。"""
         if self.frame is None:
             return
-        gray = wire_stat(self.frame, self.v_color.get())
+        gray = wire_stat(self.frame, self.v_color.get(), int(self.v_blur.get()))
         if self.roi:
             x0, y0, x1, y1 = self.roi
             sub = gray[y0:y1, x0:x1]
@@ -1002,7 +1064,8 @@ class App:
                              thr=int(self.v_thr.get()),
                              blob=int(self.v_blob.get()),
                              close=int(self.v_close.get()),
-                             use_color=self.v_color.get())
+                             use_color=self.v_color.get(),
+                             blur=int(self.v_blur.get()))
         except Exception:
             return
         H, W = self.frame.shape[:2]
@@ -1046,7 +1109,8 @@ class App:
                          thr=int(self.v_thr.get()),
                          blob=int(self.v_blob.get()),
                          close=int(self.v_close.get()),
-                         use_color=self.v_color.get())
+                         use_color=self.v_color.get(),
+                         blur=int(self.v_blur.get()))
         res = curvature_of(mask, smooth_scale=self.v_smooth.get() / 1000.0)
         if res is None:
             self.result = None
@@ -1364,7 +1428,7 @@ class App:
             return
         thr = int(self.v_thr.get()); blob = int(self.v_blob.get())
         close = int(self.v_close.get()); sm = self.v_smooth.get() / 1000.0
-        use_color = self.v_color.get()
+        use_color = self.v_color.get(); blur = int(self.v_blur.get())
         rows = []
         idxs = range(0, self.nframes, step)
         self._log(f"一括解析中… ({len(list(idxs))}フレーム)")
@@ -1375,7 +1439,7 @@ class App:
             if not ok:
                 continue
             m = wire_mask(fr, self.roi, thr=thr, blob=blob, close=close,
-                          use_color=use_color)
+                          use_color=use_color, blur=blur)
             r = curvature_of(m, smooth_scale=sm)
             if r is None:
                 continue
