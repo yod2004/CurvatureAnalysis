@@ -461,6 +461,8 @@ class App:
         self.pick_mode = False       # ワイヤクリックで閾値調整
         self.manual_mode = False     # 手動トレース(自分で点を打つ)
         self.manual_pts = []         # 手動トレースの点列 [(x,y), ...]
+        self._arc_apex = None        # 2点ドラッグ円: 弧の頂点ハンドル (x,y)
+        self._arc_dragging = False   # 2点ドラッグ円: ドラッグ中フラグ
         self.video_path = None
         self.cur_index = 0
 
@@ -615,7 +617,7 @@ class App:
         ttk.Label(ff, text="フィット:").pack(side="left")
         self.v_fit = tk.StringVar(value="spline")
         for txt, val in (("スプライン", "spline"), ("単一円", "circle"),
-                         ("区分円", "piecewise")):
+                         ("区分円", "piecewise"), ("2点円", "arc2")):
             ttk.Radiobutton(ff, text=txt, variable=self.v_fit, value=val,
                             command=self._manual_analyze).pack(side="left")
         self.v_manual_closed = tk.BooleanVar(value=False)
@@ -786,6 +788,9 @@ class App:
         self.canvas.mpl_connect("button_release_event", self._on_trim_release)
         # マウスホイールで画像をカーソル中心に拡大縮小
         self.canvas.mpl_connect("scroll_event", self._on_scroll)
+        # 2点ドラッグ円: 弧のドラッグ
+        self.canvas.mpl_connect("motion_notify_event", self._on_arc2_motion)
+        self.canvas.mpl_connect("button_release_event", self._on_arc2_release)
         # 実際の軸配置(縦並び/横並び)を構築
         self._layout_axes()
 
@@ -1103,6 +1108,7 @@ class App:
 
     def _exit_manual(self):
         self.manual_mode = False
+        self._arc_dragging = False
         self._hide_loupe()
         if self.frame is None:
             return
@@ -1112,6 +1118,10 @@ class App:
         self.update_preview()
 
     def manual_undo(self):
+        if self.v_fit.get() == "arc2":
+            self._arc2_press(type("E", (), {"button": 3, "xdata": 0,
+                                            "ydata": 0})())
+            return
         if self.manual_pts:
             self.manual_pts.pop()
         self._manual_analyze()
@@ -1119,6 +1129,8 @@ class App:
     def manual_clear(self):
         self.manual_pts = []
         self.result = None
+        self._arc_apex = None
+        self._arc_dragging = False
         self._manual_analyze()
 
     # -- ホイールズーム(カーソル中心) -------------------------------
@@ -1196,6 +1208,134 @@ class App:
         self.ax_img.set_xlim(-0.5, W - 0.5)
         self.ax_img.set_ylim(H - 0.5, -0.5)
 
+    # -- 2点ドラッグ円 -----------------------------------------------
+    def _arc_chord(self):
+        """弦の中点 m と単位法線 n, 半弦長 a を返す(点が2つ揃っているとき)。"""
+        (x1, y1), (x2, y2) = self.manual_pts[0], self.manual_pts[1]
+        mx, my = (x1 + x2) / 2.0, (y1 + y2) / 2.0
+        dx, dy = x2 - x1, y2 - y1
+        L = float(np.hypot(dx, dy))
+        if L < 1e-6:
+            return None
+        ux, uy = dx / L, dy / L
+        nx, ny = -uy, ux                    # 弦に垂直な単位ベクトル
+        return (mx, my), (nx, ny), L / 2.0
+
+    def _arc_init_apex(self):
+        """2点確定時の初期頂点(弦から少し膨らませた位置)。"""
+        ch = self._arc_chord()
+        if ch is None:
+            self._arc_apex = None
+            return
+        (mx, my), (nx, ny), a = ch
+        h = max(0.2 * (2 * a), 5.0)
+        self._arc_apex = (mx + h * nx, my + h * ny)
+
+    def _arc_set_apex_from_cursor(self, ev):
+        """カーソルの弦に対する垂直距離 h を頂点の膨らみに反映(=半径を決める)。"""
+        ch = self._arc_chord()
+        if ch is None:
+            return
+        (mx, my), (nx, ny), a = ch
+        h = (ev.xdata - mx) * nx + (ev.ydata - my) * ny
+        if abs(h) < 1.0:                    # 直線に退化しないよう最小の膨らみ
+            h = 1.0 if h >= 0 else -1.0
+        self._arc_apex = (mx + h * nx, my + h * ny)
+
+    def _arc2_result(self):
+        """現在の弦2点+頂点から円弧の結果 dict を作る(3点円)。"""
+        if len(self.manual_pts) < 2 or self._arc_apex is None:
+            return None
+        (x1, y1), (x2, y2) = self.manual_pts[0], self.manual_pts[1]
+        ax_, ay_ = self._arc_apex
+        return circle_from_xy([x1, ax_, x2], [y1, ay_, y2], closed=False)
+
+    def _arc2_press(self, ev):
+        """2点ドラッグ円のクリック処理: 2点までは点追加、以降はドラッグ開始。"""
+        if getattr(ev, "button", 1) == 3:          # 右クリック=戻す
+            if self._arc_apex is not None:
+                self._arc_apex = None
+            elif self.manual_pts:
+                self.manual_pts.pop()
+            self._arc_dragging = False
+            self._arc2_update(dragging=False)
+            return
+        if len(self.manual_pts) < 2:
+            self.manual_pts.append((float(ev.xdata), float(ev.ydata)))
+            if len(self.manual_pts) == 2:
+                self._arc_init_apex()
+            self._arc2_update(dragging=False)
+        else:                                       # 2点あり→半径ドラッグ開始
+            self._arc_dragging = True
+            self._arc_set_apex_from_cursor(ev)
+            self._arc2_update(dragging=True)
+
+    def _on_arc2_motion(self, ev):
+        if not (self.manual_mode and self.v_fit.get() == "arc2"
+                and self._arc_dragging):
+            return
+        if ev.inaxes != self.ax_img or ev.xdata is None:
+            return
+        self._arc_set_apex_from_cursor(ev)
+        self._arc2_update(dragging=True)
+
+    def _on_arc2_release(self, ev):
+        if not (self.manual_mode and self.v_fit.get() == "arc2"
+                and self._arc_dragging):
+            return
+        self._arc_dragging = False
+        self._arc2_update(dragging=False)
+
+    def _arc2_update(self, dragging):
+        """2点ドラッグ円の再描画。2点未満はガイド表示、以降は円弧を描く。"""
+        if not self.manual_mode:
+            return
+        n = len(self.manual_pts)
+        if n >= 2 and self._arc_apex is None:
+            self._arc_init_apex()
+        if n < 2 or self._arc_apex is None:
+            self.result = None
+            self.show_frame()
+            self._draw_manual_markers()
+            self._manual_view()
+            self.ax_img.set_title(
+                f"2点ドラッグ円: {n}/2点 (2点打つ→弧をドラッグで半径調整)")
+            self._loupe_bg = None
+            self.canvas.draw_idle()
+            return
+        res = self._arc2_result()
+        if res is None:
+            self.result = None
+            self.show_frame(); self._draw_manual_markers(); self._manual_view()
+            self.canvas.draw_idle()
+            return
+        if dragging:
+            self._arc2_draw_light(res)
+        else:
+            self.result = res
+            self._plot()
+            self._report()
+            self._loupe_bg = None
+
+    def _arc2_draw_light(self, res):
+        """ドラッグ中の軽量描画(円弧・弦点・頂点・中心・半径ラベルのみ)。"""
+        self.show_frame()
+        self.ax_img.plot(res["x"], res["y"], "-", color="#08f", lw=2, zorder=6)
+        cx, cy = res["center"]
+        self.ax_img.plot([cx], [cy], "+", color="#08f", ms=10, mew=1.5,
+                         zorder=6)
+        (x1, y1), (x2, y2) = self.manual_pts[0], self.manual_pts[1]
+        self.ax_img.plot([x1, x2], [y1, y2], "o", color="#ff0", ms=6,
+                         mec="k", mew=0.5, zorder=8)
+        self.ax_img.plot([self._arc_apex[0]], [self._arc_apex[1]], "o",
+                         color="#f40", ms=8, mec="k", mew=0.5, zorder=9)
+        sc = self.px_per_mm or 1.0
+        u = "mm" if self.px_per_mm else "px"
+        self.ax_img.set_title(
+            f"2点ドラッグ円: R={res['R']/sc:.1f} {u}  (ドラッグで調整)")
+        self._manual_view()
+        self.canvas.draw_idle()
+
     def _overlay_piecewise(self, res):
         """区分円: 区間境界に黒点、各円弧の中点に半径ラベルを重ねる。"""
         segs = res.get("segments", [])
@@ -1236,6 +1376,9 @@ class App:
         if not self.manual_mode:
             return
         fit = self.v_fit.get()
+        if fit == "arc2":
+            self._arc2_update(dragging=False)
+            return
         need = {"circle": 3, "spline": 4, "piecewise": 6}.get(fit, 4)
         names = {"circle": "単一円", "spline": "スプライン",
                  "piecewise": "区分円"}
@@ -1277,8 +1420,12 @@ class App:
     def _on_click(self, ev):
         if ev.inaxes != self.ax_img or ev.xdata is None:
             return
-        # --- 手動トレース: 左クリックで点追加 / 右クリックで1つ戻す ---
+        # --- 手動トレース ---
         if self.manual_mode:
+            if self.v_fit.get() == "arc2":
+                self._arc2_press(ev)
+                return
+            # 左クリックで点追加 / 右クリックで1つ戻す
             if getattr(ev, "button", 1) == 3:
                 if self.manual_pts:
                     self.manual_pts.pop()
@@ -1385,6 +1532,8 @@ class App:
     def _on_calib_motion(self, ev):
         """校正/手動トレース中、カーソルが画像上にある間だけルーペを追従表示。"""
         if not (self.calib_mode or self.manual_mode) or self.frame is None:
+            return
+        if self._arc_dragging:          # 弧ドラッグ中はルーペを出さない
             return
         if ev.inaxes != self.ax_img or ev.xdata is None:
             return
