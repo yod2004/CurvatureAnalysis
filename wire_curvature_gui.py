@@ -338,6 +338,99 @@ def circle_from_xy(x, y, npts=300, closed=False):
                 fit="circle")
 
 
+def _fit_primitive(x, y):
+    """点列に「直線」と「円」を当て、それぞれの最大偏差[px]と円パラメータを返す。
+    返り値: (line_maxdev, circ_maxdev, (cx, cy, R, circ_rms))"""
+    x = np.asarray(x, float); y = np.asarray(y, float)
+    mx, my = x.mean(), y.mean()
+    dx, dy = x - mx, y - my
+    cov = np.array([[np.sum(dx * dx), np.sum(dx * dy)],
+                    [np.sum(dx * dy), np.sum(dy * dy)]])
+    w, v = np.linalg.eigh(cov)
+    nx, ny = v[:, 0]                       # 最小固有ベクトル=直線の法線
+    line_maxdev = float(np.max(np.abs(dx * nx + dy * ny))) if len(x) else 0.0
+    cx, cy, R, rms = fit_circle_kasa(x, y)
+    if np.isfinite(R) and R > 0:
+        circ_maxdev = float(np.max(np.abs(np.hypot(x - cx, y - cy) - R)))
+    else:
+        circ_maxdev = np.inf
+    return line_maxdev, circ_maxdev, (cx, cy, R, rms)
+
+
+def _segment_arcs(x, y, tol):
+    """順序点列を、単一の円 or 直線で tol[px] 以内に収まる最長区間に貪欲分割。
+    返り値: [(i0, i1), ...](端点は隣の区間と共有)。"""
+    n = len(x)
+    segs = []
+    i = 0
+    while i < n - 1:
+        end = min(i + 2, n - 1)
+        j = i + 2
+        while j < n:
+            lm, cm, _ = _fit_primitive(x[i:j + 1], y[i:j + 1])
+            if min(lm, cm) <= tol:
+                end = j; j += 1
+            else:
+                break
+        segs.append((i, end))
+        if end >= n - 1:
+            break
+        i = end
+    if segs and segs[-1][1] < n - 1:      # 末尾まで確実に覆う
+        segs[-1] = (segs[-1][0], n - 1)
+    return segs
+
+
+def piecewise_from_xy(x, y, smooth_scale=2.0, npts=300, closed=False, tol=3.0,
+                      min_len_frac=0.04):
+    """多円弧曲線を、曲率一定の区間に自動分割して各区間に円/直線をフィット。
+    まず平滑スプラインで滑らかな密点列を作り、それを分割する。
+    κ(s) は区間ごとに一定(=1/R、直線は0)の階段状。segments に各区間の
+    種別/R/中心/残差/長さを格納。"""
+    base = curvature_from_xy(x, y, smooth_scale=smooth_scale, npts=npts,
+                             closed=closed)
+    if base is None:
+        return None
+    xs, ys, s, kap = base["x"], base["y"], base["s"], base["kappa"]
+    total = s[-1]
+    step = max(1, len(xs) // 150)          # 分割は間引いて高速化
+    idx = np.arange(0, len(xs), step)
+    if idx[-1] != len(xs) - 1:
+        idx = np.r_[idx, len(xs) - 1]
+    ranges = _segment_arcs(xs[idx], ys[idx], tol)
+    # 短すぎる区間は前の区間へ併合
+    min_len = max(min_len_frac * total, 8.0)
+    merged = [list(ranges[0])]
+    for a, b in ranges[1:]:
+        if s[idx[b]] - s[idx[a]] < min_len:
+            merged[-1][1] = b
+        else:
+            merged.append([a, b])
+    kap_pw = np.zeros_like(kap)
+    segments = []
+    for a, b in merged:
+        i0, i1 = int(idx[a]), int(idx[b])
+        xseg, yseg = xs[i0:i1 + 1], ys[i0:i1 + 1]
+        lm, cm, (cx, cy, R, rms) = _fit_primitive(xseg, yseg)
+        # 直線が tol 以内で説明できる区間は「直線(R≈∞)」とみなす
+        is_line = (not np.isfinite(R)) or R > 1e4 or lm <= tol or lm <= cm
+        sgn = np.sign(np.nanmedian(kap[i0:i1 + 1]))
+        if sgn == 0:
+            sgn = 1.0
+        kval = 0.0 if is_line else float(sgn / R)
+        resid = lm if is_line else rms
+        kap_pw[i0:i1 + 1] = kval
+        segments.append(dict(kind=("line" if is_line else "arc"),
+                             R=(np.inf if is_line else float(R)),
+                             center=(float(cx), float(cy)),
+                             resid=float(resid),
+                             s0=float(s[i0]), s1=float(s[i1]),
+                             length=float(s[i1] - s[i0]), kappa=kval,
+                             i0=i0, i1=i1))
+    return dict(x=xs, y=ys, kappa=kap_pw, s=s, total_len=total,
+                closed=bool(closed), segments=segments, fit="piecewise")
+
+
 def curvature_of(mask, smooth_scale=2.0, npts=300):
     """マスク -> 中心線曲率。返り値 dict(x,y,kappa,s,total_len) 単位は px / 1/px"""
     sk = skeletonize(mask > 0)
@@ -517,12 +610,14 @@ class App:
             side="left", expand=True, fill="x", padx=(0, 2))
         ttk.Button(mrf, text="全消去", command=self.manual_clear).pack(
             side="left", expand=True, fill="x", padx=(2, 0))
-        self.v_circle = tk.BooleanVar(value=False)
-        ttk.Checkbutton(
-            mb, text="円フィット(一定曲率: 円弧の半径Rを測る)",
-            variable=self.v_circle,
-            command=self._manual_analyze).grid(
-            row=2, column=0, columnspan=2, sticky="w")
+        # フィット方式: スプライン(自由曲線) / 単一円 / 区分円(多円弧)
+        ff = ttk.Frame(mb); ff.grid(row=2, column=0, columnspan=2, sticky="w")
+        ttk.Label(ff, text="フィット:").pack(side="left")
+        self.v_fit = tk.StringVar(value="spline")
+        for txt, val in (("スプライン", "spline"), ("単一円", "circle"),
+                         ("区分円", "piecewise")):
+            ttk.Radiobutton(ff, text=txt, variable=self.v_fit, value=val,
+                            command=self._manual_analyze).pack(side="left")
         self.v_manual_closed = tk.BooleanVar(value=False)
         ttk.Checkbutton(mb, text="閉じる(周期/全円=一周ループ)",
                         variable=self.v_manual_closed,
@@ -533,6 +628,13 @@ class App:
         ttk.Label(hf, text="なめらかさ").pack(side="left")
         ttk.Scale(hf, from_=100, to=8000, orient="horizontal",
                   variable=self.v_smooth,
+                  command=lambda _v: self._manual_analyze()).pack(
+            side="left", expand=True, fill="x", padx=4)
+        pf = ttk.Frame(mb); pf.grid(row=5, column=0, columnspan=2, sticky="ew")
+        ttk.Label(pf, text="区分許容[px]").pack(side="left")
+        self.v_pwtol = tk.IntVar(value=3)
+        ttk.Scale(pf, from_=1, to=20, orient="horizontal",
+                  variable=self.v_pwtol,
                   command=lambda _v: self._manual_analyze()).pack(
             side="left", expand=True, fill="x", padx=4)
         mb.columnconfigure(0, weight=1)
@@ -1094,6 +1196,31 @@ class App:
         self.ax_img.set_xlim(-0.5, W - 0.5)
         self.ax_img.set_ylim(H - 0.5, -0.5)
 
+    def _overlay_piecewise(self, res):
+        """区分円: 区間境界に黒点、各円弧の中点に半径ラベルを重ねる。"""
+        segs = res.get("segments", [])
+        x, y = res["x"], res["y"]
+        sc = self.px_per_mm or 1.0
+        unit = "mm" if self.px_per_mm else "px"
+        for sg in segs:
+            i0, i1 = sg["i0"], sg["i1"]
+            self.ax_img.plot([x[i0]], [y[i0]], "o", color="k", ms=4, zorder=7)
+            mid = (i0 + i1) // 2
+            if sg["kind"] == "line":
+                txt = "直線"
+            else:
+                txt = f"R={sg['R']/sc:.0f}{unit}"
+            self.ax_img.annotate(
+                txt, (x[mid], y[mid]), color="k", fontsize=8,
+                fontweight="bold", zorder=9,
+                textcoords="offset points", xytext=(6, 6),
+                bbox=dict(boxstyle="round,pad=0.15", fc="w", ec="none",
+                          alpha=0.6))
+        # 最後の境界
+        if segs:
+            self.ax_img.plot([x[segs[-1]["i1"]]], [y[segs[-1]["i1"]]], "o",
+                             color="k", ms=4, zorder=7)
+
     def _draw_manual_markers(self):
         """手動点(黄マーカー)とガイド折れ線を画像上に重ねる(ビューは変えない)。"""
         if not self.manual_pts:
@@ -1108,27 +1235,32 @@ class App:
         """手動点列から曲率を計算して描画。円フィット時は3点、スプライン時は4点必要。"""
         if not self.manual_mode:
             return
-        use_circle = self.v_circle.get()
-        need = 3 if use_circle else 4
+        fit = self.v_fit.get()
+        need = {"circle": 3, "spline": 4, "piecewise": 6}.get(fit, 4)
+        names = {"circle": "単一円", "spline": "スプライン",
+                 "piecewise": "区分円"}
         if len(self.manual_pts) < need:
             self.result = None
             self.show_frame()
             self._draw_manual_markers()
             self._manual_view()
-            mode = "円フィット" if use_circle else "手動トレース"
             self.ax_img.set_title(
-                f"{mode}: {len(self.manual_pts)}点 ({need}点以上で計算)")
+                f"{names.get(fit)}: {len(self.manual_pts)}点 "
+                f"({need}点以上で計算)")
             self._loupe_bg = None
             self.canvas.draw_idle()
             return
         xs = np.array([p[0] for p in self.manual_pts])
         ys = np.array([p[1] for p in self.manual_pts])
-        if use_circle:
-            res = circle_from_xy(xs, ys, closed=self.v_manual_closed.get())
+        smooth = self.v_smooth.get() / 1000.0
+        closed = self.v_manual_closed.get()
+        if fit == "circle":
+            res = circle_from_xy(xs, ys, closed=closed)
+        elif fit == "piecewise":
+            res = piecewise_from_xy(xs, ys, smooth_scale=smooth, closed=closed,
+                                    tol=float(self.v_pwtol.get()))
         else:
-            res = curvature_from_xy(xs, ys,
-                                    smooth_scale=self.v_smooth.get() / 1000.0,
-                                    closed=self.v_manual_closed.get())
+            res = curvature_from_xy(xs, ys, smooth_scale=smooth, closed=closed)
         if res is None:
             self.result = None
             self.show_frame()
@@ -1533,8 +1665,8 @@ class App:
         label = "曲率半径" if is_r else "曲率"
         # ビュー: 手動トレースはフレーム全体を表示して点も重畳。自動は ROI にズーム。
         if self.manual_mode:
-            # 円フィット時はフィットした円と中心を薄く重ねる(視覚確認用)
-            if res.get("center") is not None:
+            if res.get("fit") == "circle" and res.get("center") is not None:
+                # 単一円: フィットした円と中心を薄く重ねる
                 cx, cy = res["center"]
                 tt = np.linspace(0, 2 * np.pi, 240)
                 self.ax_img.plot(cx + res["R"] * np.cos(tt),
@@ -1542,9 +1674,12 @@ class App:
                                  ":", color="#0af", lw=1.0, zorder=6)
                 self.ax_img.plot([cx], [cy], "+", color="#0af", ms=11, mew=1.5,
                                  zorder=6)
+            elif res.get("fit") == "piecewise":
+                self._overlay_piecewise(res)
             self._draw_manual_markers()
             self._manual_view()
-            head = "円フィット" if res.get("fit") == "circle" else "手動トレース"
+            heads = {"circle": "単一円", "piecewise": "区分円"}
+            head = heads.get(res.get("fit"), "手動トレース")
             self.ax_img.set_title(f"{head} {label}カラー  (R中央値="
                                   f"{self._Rmed_str()})")
         else:
@@ -1670,6 +1805,9 @@ class App:
 
     def _report(self):
         res = self.result
+        if res.get("fit") == "piecewise":
+            self._report_piecewise(res)
+            return
         inc = self._inc_mask(res)
         k = self._kappa_signed(res)[inc]
         kmed = np.nanmedian(k)
@@ -1704,6 +1842,24 @@ class App:
                 f" κ平均 : {kmean:.5f} 1/px",
                 f" R中央値: {Rpx:.1f} px",
                 " (未校正: 実寸は校正後に表示)"]
+        self._log("\n".join(lines))
+
+    def _report_piecewise(self, res):
+        """区分円フィットの各区間(R・長さ・残差)を一覧表示。"""
+        segs = res["segments"]
+        sc = self.px_per_mm or 1.0
+        u = "mm" if self.px_per_mm else "px"
+        lines = [f"[区分円フィット: {len(segs)}区間]"]
+        for i, sg in enumerate(segs, 1):
+            L = sg["length"] / sc
+            if sg["kind"] == "line":
+                lines.append(f" {i}. 直線 (R≈∞)  長さ{L:.1f}{u} "
+                             f"残差{sg['resid']:.2f}px")
+            else:
+                lines.append(f" {i}. R={sg['R']/sc:.2f}{u}  長さ{L:.1f}{u} "
+                             f"残差{sg['resid']:.2f}px")
+        if not self.px_per_mm:
+            lines.append(" (未校正: 実寸は校正後に表示)")
         self._log("\n".join(lines))
 
     # -- 出力 --------------------------------------------------------
