@@ -259,42 +259,52 @@ def _order_skeleton(sk):
     return longest_path(), False
 
 
-def curvature_of(mask, smooth_scale=2.0, npts=300):
-    """マスク -> 中心線曲率。返り値 dict(x,y,kappa,s,total_len) 単位は px / 1/px"""
-    sk = skeletonize(mask > 0)
-    ordered, closed = _order_skeleton(sk.astype(np.uint8))
-    if ordered is None or len(ordered) < 12:
+def curvature_from_xy(x, y, smooth_scale=2.0, npts=300, closed=False):
+    """順序付き点列 (x,y) から平滑化スプラインの曲率を計算する。
+    自動抽出(skeleton)と手動トレースの共通処理。返り値 dict(x,y,kappa,s,...)。
+    符号付き曲率(絶対値を取らない)。単位は px / 1/px。"""
+    x = np.asarray(x, dtype=float)
+    y = np.asarray(y, dtype=float)
+    if len(x) < 4:
         return None
-    y = ordered[:, 0].astype(float)
-    x = ordered[:, 1].astype(float)
     d = np.r_[0, np.cumsum(np.hypot(np.diff(x), np.diff(y)))]
     if d[-1] <= 0:
         return None
     s_par = d / d[-1]
     smooth = max(len(x) * float(smooth_scale), 1.0)
+    k = min(3, len(x) - 1)
     per = 1 if closed else 0
-    try:
-        tck, _ = splprep([x, y], u=s_par, s=smooth, k=3, per=per)
-    except Exception:
-        if per:                        # 周期スプラインが不調なら開曲線で再試行
-            try:
-                tck, _ = splprep([x, y], u=s_par, s=smooth, k=3, per=0)
-            except Exception:
-                return None
-        else:
-            return None
+    tck = None
+    # 周期→開曲線→補間(s=0) の順に頑健にフォールバック
+    for per_try, s_try in ((per, smooth), (0, smooth), (0, 0.0)):
+        try:
+            tck, _ = splprep([x, y], u=s_par, s=s_try, k=k, per=per_try)
+            break
+        except Exception:
+            tck = None
+    if tck is None:
+        return None
     uu = np.linspace(0, 1, npts)
     xs, ys = splev(uu, tck)
     dx, dy = splev(uu, tck, der=1)
     ddx, ddy = splev(uu, tck, der=2)
     denom = np.power(dx * dx + dy * dy, 1.5)
     denom[denom == 0] = np.nan
-    # 符号付き曲率(絶対値を取らない)。符号は曲がる向きを表す。
-    # 表示側で絶対値/符号付きを切替できる(App._kappa_signed)。
     kappa = (dx * ddy - dy * ddx) / denom            # 1/px (signed)
     s = np.r_[0, np.cumsum(np.hypot(np.diff(xs), np.diff(ys)))]  # px
     return dict(x=xs, y=ys, kappa=kappa, s=s, total_len=s[-1],
-                closed=closed)
+                closed=bool(closed))
+
+
+def curvature_of(mask, smooth_scale=2.0, npts=300):
+    """マスク -> 中心線曲率。返り値 dict(x,y,kappa,s,total_len) 単位は px / 1/px"""
+    sk = skeletonize(mask > 0)
+    ordered, closed = _order_skeleton(sk.astype(np.uint8))
+    if ordered is None or len(ordered) < 12:
+        return None
+    return curvature_from_xy(ordered[:, 1], ordered[:, 0],
+                             smooth_scale=smooth_scale, npts=npts,
+                             closed=closed)
 
 
 # ----------------------------------------------------------------------
@@ -314,6 +324,8 @@ class App:
         self.calib_mode = False
         self.calib_pts = []
         self.pick_mode = False       # ワイヤクリックで閾値調整
+        self.manual_mode = False     # 手動トレース(自分で点を打つ)
+        self.manual_pts = []         # 手動トレースの点列 [(x,y), ...]
         self.video_path = None
         self.cur_index = 0
 
@@ -457,6 +469,24 @@ class App:
         rf = ttk.Frame(p); rf.grid(row=r, column=0, columnspan=2, sticky="ew"); r += 1
         ttk.Label(rf, text="ROI: 画像上をドラッグ", foreground="#555").pack(side="left")
         ttk.Button(rf, text="全体にリセット", command=self.reset_roi).pack(side="right")
+
+        # 手動トレース(自動検出が苦手な構図で、自分で点を打って円弧を描く)
+        sepm = ttk.Separator(p); sepm.grid(row=r, column=0, columnspan=2,
+                                           sticky="ew", pady=6); r += 1
+        self.btn_manual = ttk.Button(p, text="手動トレース",
+                                     command=self.toggle_manual)
+        self.btn_manual.grid(row=r, column=0, columnspan=2, sticky="ew"); r += 1
+        mrf = ttk.Frame(p); mrf.grid(row=r, column=0, columnspan=2,
+                                     sticky="ew"); r += 1
+        ttk.Button(mrf, text="1つ戻す", command=self.manual_undo).pack(
+            side="left", expand=True, fill="x", padx=(0, 2))
+        ttk.Button(mrf, text="全消去", command=self.manual_clear).pack(
+            side="left", expand=True, fill="x", padx=(2, 0))
+        self.v_manual_closed = tk.BooleanVar(value=False)
+        ttk.Checkbutton(p, text="閉じる(周期スプライン=一周ループ)",
+                        variable=self.v_manual_closed,
+                        command=self._manual_analyze).grid(
+            row=r, column=0, columnspan=2, sticky="w"); r += 1
 
         # 校正
         sep = ttk.Separator(p); sep.grid(row=r, column=0, columnspan=2, sticky="ew", pady=6); r += 1
@@ -767,7 +797,11 @@ class App:
         self.load_frame(self._pending_frame)
         self.result = None
         self.show_frame()
-        self.update_preview()
+        if self.manual_mode:
+            # 手動点は画像座標なのでフレームを跨いでも有効。新フレームで再フィット。
+            self._manual_analyze()
+        else:
+            self.update_preview()
 
     # -- ROI / 校正 / クリック調整 -----------------------------------
     def _on_roi(self, e1, e2):
@@ -852,8 +886,95 @@ class App:
         self.btn_pick.config(text="ワイヤをクリックで調整")
         self.selector.set_active(True)
 
+    # -- 手動トレース ------------------------------------------------
+    def toggle_manual(self):
+        """手動トレースモードの ON/OFF。ワイヤ上をクリックして点を打つ。"""
+        if self.frame is None:
+            messagebox.showinfo("情報", "先に動画/画像を開いてください")
+            return
+        self.manual_mode = not self.manual_mode
+        if self.manual_mode:
+            self.calib_mode = False
+            self.pick_mode = False
+            self.selector.set_active(False)
+            self.btn_manual.config(text="手動トレース: ON(終了はもう一度)")
+            self._ensure_loupe()
+            self._loupe_bg = None
+            self._log("手動トレース: ワイヤに沿って点を順にクリック。\n"
+                      "・右クリック=1つ戻す / 『全消去』=リセット\n"
+                      "・4点以上で曲率を計算。カーソル周辺はルーペで拡大表示\n"
+                      "・一周させるなら『閉じる(周期)』にチェック")
+            self._manual_analyze()
+        else:
+            self.selector.set_active(True)
+            self.btn_manual.config(text="手動トレース")
+            self._hide_loupe()
+
+    def manual_undo(self):
+        if self.manual_pts:
+            self.manual_pts.pop()
+        self._manual_analyze()
+
+    def manual_clear(self):
+        self.manual_pts = []
+        self.result = None
+        self._manual_analyze()
+
+    def _draw_manual_markers(self):
+        """手動点(黄マーカー)とガイド折れ線を画像上に重ね、点群にビューを合わせる。"""
+        if not self.manual_pts:
+            return
+        xs = [p[0] for p in self.manual_pts]
+        ys = [p[1] for p in self.manual_pts]
+        self.ax_img.plot(xs, ys, "-", color="0.85", lw=0.8, zorder=7)
+        self.ax_img.plot(xs, ys, "o", color="#ff0", ms=5, mec="k", mew=0.5,
+                         zorder=8)
+        pad = 40
+        self.ax_img.set_xlim(min(xs) - pad, max(xs) + pad)
+        self.ax_img.set_ylim(max(ys) + pad, min(ys) - pad)
+
+    def _manual_analyze(self):
+        """手動点列から曲率を計算して描画。4点未満なら点だけ表示。"""
+        if not self.manual_mode:
+            return
+        if len(self.manual_pts) < 4:
+            self.result = None
+            self.show_frame()
+            self._draw_manual_markers()
+            self.ax_img.set_title(
+                f"手動トレース: {len(self.manual_pts)}点 "
+                f"(4点以上で曲率計算)")
+            self._loupe_bg = None
+            self.canvas.draw_idle()
+            return
+        xs = np.array([p[0] for p in self.manual_pts])
+        ys = np.array([p[1] for p in self.manual_pts])
+        res = curvature_from_xy(xs, ys,
+                                smooth_scale=self.v_smooth.get() / 1000.0,
+                                closed=self.v_manual_closed.get())
+        if res is None:
+            self.result = None
+            self.show_frame()
+            self._draw_manual_markers()
+            self._loupe_bg = None
+            self.canvas.draw_idle()
+            return
+        self.result = res
+        self._plot()             # 曲率カラー中心線 + κ/R グラフ(手動点も重畳)
+        self._report()
+        self._loupe_bg = None    # 再描画で背景が変わったのでルーペ背景を取り直す
+
     def _on_click(self, ev):
         if ev.inaxes != self.ax_img or ev.xdata is None:
+            return
+        # --- 手動トレース: 左クリックで点追加 / 右クリックで1つ戻す ---
+        if self.manual_mode:
+            if getattr(ev, "button", 1) == 3:
+                if self.manual_pts:
+                    self.manual_pts.pop()
+            else:
+                self.manual_pts.append((float(ev.xdata), float(ev.ydata)))
+            self._manual_analyze()
             return
         # --- ワイヤクリックで閾値調整 ---
         if self.pick_mode:
@@ -952,8 +1073,8 @@ class App:
         return cv2.cvtColor(bgr, cv2.COLOR_BGR2RGB), (x0, x1, y0, y1)
 
     def _on_calib_motion(self, ev):
-        """校正中、カーソルが画像上にある間だけルーペを追従表示。"""
-        if not self.calib_mode or self.frame is None:
+        """校正/手動トレース中、カーソルが画像上にある間だけルーペを追従表示。"""
+        if not (self.calib_mode or self.manual_mode) or self.frame is None:
             return
         if ev.inaxes != self.ax_img or ev.xdata is None:
             return
@@ -1032,6 +1153,10 @@ class App:
         """スライダー連続変化をデバウンスしてプレビュー更新(重い再計算を間引く)。"""
         if self.frame is None:
             return
+        if self.manual_mode:
+            # 手動トレース中は④なめらかさ変更を点列の再フィットに反映
+            self._manual_analyze()
+            return
         # 解析結果を表示中にパラメータを触ったら、ライブプレビューに戻す
         if self.result is not None:
             self.result = None
@@ -1051,6 +1176,8 @@ class App:
     def update_preview(self):
         """現在のスライダー設定でマスクを計算し、赤の半透明で重ねる。"""
         self._preview_job = None
+        if self.manual_mode:            # 手動トレース中は赤マスクを出さない
+            return
         if self.frame is None or not self.v_preview.get():
             return
         if self.result is not None:
@@ -1224,18 +1351,24 @@ class App:
             cmap = "jet_r" if is_r else "jet"
         sc = self.ax_img.scatter(res["x"][inc], res["y"][inc], c=v_disp[inc],
                                  cmap=cmap, s=7, vmin=vmin, vmax=vmax)
-        x0, y0, x1, y1 = self.roi
-        self.ax_img.set_xlim(x0 - 10, x1 + 10)
-        self.ax_img.set_ylim(y1 + 10, y0 - 10)
         label = "曲率半径" if is_r else "曲率"
-        self.ax_img.set_title(f"中心線 {label}カラー  (R中央値="
-                              f"{self._Rmed_str()})")
+        # ビュー: 手動トレースは点群に合わせ、点も重畳。自動は ROI にズーム。
+        if self.manual_mode and self.manual_pts:
+            self._draw_manual_markers()
+            self.ax_img.set_title(f"手動トレース {label}カラー  (R中央値="
+                                  f"{self._Rmed_str()})")
+        else:
+            x0, y0, x1, y1 = self.roi
+            self.ax_img.set_xlim(x0 - 10, x1 + 10)
+            self.ax_img.set_ylim(y1 + 10, y0 - 10)
+            self.ax_img.set_title(f"中心線 {label}カラー  (R中央値="
+                                  f"{self._Rmed_str()})")
+            self._draw_roi_rect()
         # 固定枠(cax)にカラーバーを描き直す。ax_img のサイズは変わらない
         self.cax.set_visible(True)
         self.cax.cla()
         self.cbar = self.fig.colorbar(sc, cax=self.cax,
                                       label=f"{name} [{unit}]")
-        self._draw_roi_rect()
 
         self._draw_kappa()
         self.canvas.draw_idle()
