@@ -392,55 +392,105 @@ class App:
         self.lbl_frame = ttk.Label(p, text="0 / 0")
         self.lbl_frame.grid(row=r, column=0, columnspan=2, sticky="w"); r += 1
 
-        # ライブプレビュー トグル
-        sep0 = ttk.Separator(p); sep0.grid(row=r, column=0, columnspan=2, sticky="ew", pady=6); r += 1
+        # ── モード切替(根本の動作: 自動検出 / 手動トレース) ──
+        sepmode = ttk.Separator(p); sepmode.grid(
+            row=r, column=0, columnspan=2, sticky="ew", pady=(6, 2)); r += 1
+        mf = ttk.Frame(p); mf.grid(row=r, column=0, columnspan=2, sticky="w")
+        r += 1
+        ttk.Label(mf, text="モード:", font=("TkDefaultFont", 9, "bold")).pack(
+            side="left")
+        self.v_mode = tk.StringVar(value="auto")
+        ttk.Radiobutton(mf, text="自動検出", variable=self.v_mode, value="auto",
+                        command=self._on_mode_change).pack(side="left")
+        ttk.Radiobutton(mf, text="手動トレース", variable=self.v_mode,
+                        value="manual",
+                        command=self._on_mode_change).pack(side="left")
+
+        # ── 自動検出モードのコントロール群(auto_box) ──
+        self.auto_box = ttk.Frame(p)
+        ab = self.auto_box
         self.v_preview = tk.BooleanVar(value=True)
-        ttk.Checkbutton(p, text="ライブプレビュー(抽出マスクを赤で重ねる)",
+        ttk.Checkbutton(ab, text="ライブプレビュー(抽出マスクを赤で重ねる)",
                         variable=self.v_preview,
                         command=self._on_preview_toggle).grid(
-            row=r, column=0, columnspan=2, sticky="w"); r += 1
-        # 青背景を色で分離(細い/暗いワイヤの断片化に有効)
+            row=0, column=0, columnspan=2, sticky="w")
         self.v_color = tk.BooleanVar(value=True)
-        ttk.Checkbutton(
-            p, text="青背景を色で分離(推奨: 細い銀ワイヤ)",
-            variable=self.v_color,
-            command=self._on_color_toggle).grid(
-            row=r, column=0, columnspan=2, sticky="w"); r += 1
-
-        # 各種スライダ(分かりやすいラベル + 一行ヘルプ)
+        ttk.Checkbutton(ab, text="青背景を色で分離(推奨: 細い銀ワイヤ)",
+                        variable=self.v_color,
+                        command=self._on_color_toggle).grid(
+            row=1, column=0, columnspan=2, sticky="w")
+        self._slider_next_row = 2
         self.v_thr = self._slider(
-            p, "thr", "① 明るさしきい値", 0, 255, 150,
+            ab, "thr", "① 明るさしきい値", 0, 255, 150,
             help="これより明るい画素をワイヤとみなす。ワイヤが消えるなら下げる"
                  "(色分離ON時は各画素の最小チャネルに対する閾値)")
-        # 閾値の補助ボタン(自動 / クリック調整)
         rr = self._slider_next_row
-        bf = ttk.Frame(p); bf.grid(row=rr, column=0, columnspan=2, sticky="ew"); r = rr + 1
+        bf = ttk.Frame(ab); bf.grid(row=rr, column=0, columnspan=2, sticky="ew")
         ttk.Button(bf, text="明るさ自動(Otsu)", command=self.auto_threshold).pack(
             side="left", expand=True, fill="x", padx=(0, 2))
-        self.btn_pick = ttk.Button(bf, text="ワイヤをクリックで調整", command=self.start_pick)
+        self.btn_pick = ttk.Button(bf, text="ワイヤをクリックで調整",
+                                   command=self.start_pick)
         self.btn_pick.pack(side="left", expand=True, fill="x", padx=(2, 0))
-        self._slider_next_row = r
-
+        self._slider_next_row = rr + 1
         self.v_blob = self._slider(
-            p, "blob", "② 太い部分を消す", 0, 41, 17,
+            ab, "blob", "② 太い部分を消す", 0, 41, 17,
             help="ヘッドやセンサの太い塊を除去。ワイヤまで消えるなら下げる")
         self.v_close = self._slider(
-            p, "close", "③ 線をつなぐ", 0, 41, 11,
+            ab, "close", "③ 線をつなぐ", 0, 41, 11,
             help="途切れた線を橋渡し。断片化して抽出できないなら上げる")
         self.v_smooth = self._slider(
-            p, "smooth", "④ なめらかさ", 100, 8000, 2000,
+            ab, "smooth", "④ なめらかさ", 100, 8000, 2000,
             help="曲率のノイズ抑制。ガタつくなら上げ、鈍るなら下げる",
             scale=0.001, step=50)
         self.v_blur = self._slider(
-            p, "blur", "⑤ 中心化ぼかし", 0, 12, 0,
+            ab, "blur", "⑤ 中心化ぼかし", 0, 12, 0,
             help="0で無効。閾値化の前にぼかし、光沢の片側ハイライトや縁の"
                  "ギザギザを融合→中心線が真ん中を通りやすくなる。縁が拾われて"
                  "トレースがズレるとき1〜4程度から上げる")
-        r = self._slider_next_row
+        ar = self._slider_next_row
+        ttk.Button(ab, text="解析 (このフレーム)", command=self.analyze).grid(
+            row=ar, column=0, columnspan=2, sticky="ew", pady=(8, 2)); ar += 1
+        rf = ttk.Frame(ab); rf.grid(row=ar, column=0, columnspan=2, sticky="ew")
+        ttk.Label(rf, text="ROI: 画像上をドラッグ", foreground="#555").pack(
+            side="left")
+        ttk.Button(rf, text="全体にリセット", command=self.reset_roi).pack(
+            side="right")
+        ab.columnconfigure(0, weight=1)
 
-        ttk.Button(p, text="解析 (このフレーム)", command=self.analyze).grid(
-            row=r, column=0, columnspan=2, sticky="ew", pady=(8, 2)); r += 1
+        # ── 手動トレースモードのコントロール群(manual_box) ──
+        self.manual_box = ttk.Frame(p)
+        mb = self.manual_box
+        ttk.Label(mb, foreground="#555", wraplength=250,
+                  text="ワイヤ上を順にクリックして点を打つ。\n"
+                       "右クリック=1つ戻す。4点以上で曲率を計算。\n"
+                       "カーソル周辺はルーペで拡大表示されます。").grid(
+            row=0, column=0, columnspan=2, sticky="w")
+        mrf = ttk.Frame(mb); mrf.grid(row=1, column=0, columnspan=2, sticky="ew")
+        ttk.Button(mrf, text="1つ戻す", command=self.manual_undo).pack(
+            side="left", expand=True, fill="x", padx=(0, 2))
+        ttk.Button(mrf, text="全消去", command=self.manual_clear).pack(
+            side="left", expand=True, fill="x", padx=(2, 0))
+        self.v_manual_closed = tk.BooleanVar(value=False)
+        ttk.Checkbutton(mb, text="閉じる(周期スプライン=一周ループ)",
+                        variable=self.v_manual_closed,
+                        command=self._manual_analyze).grid(
+            row=2, column=0, columnspan=2, sticky="w")
+        hf = ttk.Frame(mb); hf.grid(row=3, column=0, columnspan=2, sticky="ew",
+                                    pady=(4, 0))
+        ttk.Label(hf, text="なめらかさ").pack(side="left")
+        ttk.Scale(hf, from_=100, to=8000, orient="horizontal",
+                  variable=self.v_smooth,
+                  command=lambda _v: self._manual_analyze()).pack(
+            side="left", expand=True, fill="x", padx=4)
+        mb.columnconfigure(0, weight=1)
 
+        # 両モードのコントロール群を同じセルに重ね、選択中の片方だけ表示する
+        self.auto_box.grid(row=r, column=0, columnspan=2, sticky="ew")
+        self.manual_box.grid(row=r, column=0, columnspan=2, sticky="ew")
+        self.manual_box.grid_remove()
+        r += 1
+
+        # ── 以下は両モード共通 ──
         # グラフの縦軸: 曲率κ / 曲率半径R の切替
         gf = ttk.Frame(p); gf.grid(row=r, column=0, columnspan=2, sticky="w"); r += 1
         ttk.Label(gf, text="グラフ:").pack(side="left")
@@ -449,7 +499,6 @@ class App:
                         command=self._on_metric_toggle).pack(side="left")
         ttk.Radiobutton(gf, text="曲率半径 R", variable=self.v_radius, value=True,
                         command=self._on_metric_toggle).pack(side="left")
-        # 符号付き(±): 負の曲率(曲がる向き)も表示する
         self.v_signed = tk.BooleanVar(value=True)
         ttk.Checkbutton(gf, text="符号付き(±)", variable=self.v_signed,
                         command=self._on_metric_toggle).pack(side="left",
@@ -464,29 +513,6 @@ class App:
         ttk.Radiobutton(lf, text="横並び(縦長向き)", variable=self.v_layout,
                         value="side",
                         command=self._on_layout_change).pack(side="left")
-
-        # ROI
-        rf = ttk.Frame(p); rf.grid(row=r, column=0, columnspan=2, sticky="ew"); r += 1
-        ttk.Label(rf, text="ROI: 画像上をドラッグ", foreground="#555").pack(side="left")
-        ttk.Button(rf, text="全体にリセット", command=self.reset_roi).pack(side="right")
-
-        # 手動トレース(自動検出が苦手な構図で、自分で点を打って円弧を描く)
-        sepm = ttk.Separator(p); sepm.grid(row=r, column=0, columnspan=2,
-                                           sticky="ew", pady=6); r += 1
-        self.btn_manual = ttk.Button(p, text="手動トレース",
-                                     command=self.toggle_manual)
-        self.btn_manual.grid(row=r, column=0, columnspan=2, sticky="ew"); r += 1
-        mrf = ttk.Frame(p); mrf.grid(row=r, column=0, columnspan=2,
-                                     sticky="ew"); r += 1
-        ttk.Button(mrf, text="1つ戻す", command=self.manual_undo).pack(
-            side="left", expand=True, fill="x", padx=(0, 2))
-        ttk.Button(mrf, text="全消去", command=self.manual_clear).pack(
-            side="left", expand=True, fill="x", padx=(2, 0))
-        self.v_manual_closed = tk.BooleanVar(value=False)
-        ttk.Checkbutton(p, text="閉じる(周期スプライン=一周ループ)",
-                        variable=self.v_manual_closed,
-                        command=self._manual_analyze).grid(
-            row=r, column=0, columnspan=2, sticky="w"); r += 1
 
         # 校正
         sep = ttk.Separator(p); sep.grid(row=r, column=0, columnspan=2, sticky="ew", pady=6); r += 1
@@ -886,29 +912,43 @@ class App:
         self.btn_pick.config(text="ワイヤをクリックで調整")
         self.selector.set_active(True)
 
-    # -- 手動トレース ------------------------------------------------
-    def toggle_manual(self):
-        """手動トレースモードの ON/OFF。ワイヤ上をクリックして点を打つ。"""
-        if self.frame is None:
-            messagebox.showinfo("情報", "先に動画/画像を開いてください")
-            return
-        self.manual_mode = not self.manual_mode
-        if self.manual_mode:
-            self.calib_mode = False
-            self.pick_mode = False
-            self.selector.set_active(False)
-            self.btn_manual.config(text="手動トレース: ON(終了はもう一度)")
-            self._ensure_loupe()
-            self._loupe_bg = None
-            self._log("手動トレース: ワイヤに沿って点を順にクリック。\n"
-                      "・右クリック=1つ戻す / 『全消去』=リセット\n"
-                      "・4点以上で曲率を計算。カーソル周辺はルーペで拡大表示\n"
-                      "・一周させるなら『閉じる(周期)』にチェック")
-            self._manual_analyze()
+    # -- モード切替 / 手動トレース ------------------------------------
+    def _on_mode_change(self):
+        """根本のモード切替(自動検出 / 手動トレース)。コントロール群を出し分ける。"""
+        if self.v_mode.get() == "manual":
+            self.auto_box.grid_remove()
+            self.manual_box.grid()
+            self._enter_manual()
         else:
-            self.selector.set_active(True)
-            self.btn_manual.config(text="手動トレース")
-            self._hide_loupe()
+            self.manual_box.grid_remove()
+            self.auto_box.grid()
+            self._exit_manual()
+
+    def _enter_manual(self):
+        self.manual_mode = True
+        self.calib_mode = False
+        self.pick_mode = False
+        if self.frame is None:
+            self._log("手動トレース: 先に動画/画像を開いてください。")
+            return
+        self.selector.set_active(False)
+        self._ensure_loupe()
+        self._loupe_bg = None
+        self._log("手動トレース: ワイヤに沿って点を順にクリック。\n"
+                  "・右クリック=1つ戻す / 『全消去』=リセット\n"
+                  "・4点以上で曲率を計算(カーソル周辺はルーペ拡大)\n"
+                  "・一周させるなら『閉じる(周期)』にチェック")
+        self._manual_analyze()
+
+    def _exit_manual(self):
+        self.manual_mode = False
+        self._hide_loupe()
+        if self.frame is None:
+            return
+        self.selector.set_active(True)
+        self.result = None
+        self.show_frame()
+        self.update_preview()
 
     def manual_undo(self):
         if self.manual_pts:
@@ -920,8 +960,17 @@ class App:
         self.result = None
         self._manual_analyze()
 
+    def _manual_view(self):
+        """手動トレース時の画像ビュー = フレーム全体(点群に追従してズームしない)。
+        全体が見えていればワイヤのどこでもクリックできる。"""
+        if self.frame is None:
+            return
+        H, W = self.frame.shape[:2]
+        self.ax_img.set_xlim(-0.5, W - 0.5)
+        self.ax_img.set_ylim(H - 0.5, -0.5)
+
     def _draw_manual_markers(self):
-        """手動点(黄マーカー)とガイド折れ線を画像上に重ね、点群にビューを合わせる。"""
+        """手動点(黄マーカー)とガイド折れ線を画像上に重ねる(ビューは変えない)。"""
         if not self.manual_pts:
             return
         xs = [p[0] for p in self.manual_pts]
@@ -929,9 +978,6 @@ class App:
         self.ax_img.plot(xs, ys, "-", color="0.85", lw=0.8, zorder=7)
         self.ax_img.plot(xs, ys, "o", color="#ff0", ms=5, mec="k", mew=0.5,
                          zorder=8)
-        pad = 40
-        self.ax_img.set_xlim(min(xs) - pad, max(xs) + pad)
-        self.ax_img.set_ylim(max(ys) + pad, min(ys) - pad)
 
     def _manual_analyze(self):
         """手動点列から曲率を計算して描画。4点未満なら点だけ表示。"""
@@ -941,6 +987,7 @@ class App:
             self.result = None
             self.show_frame()
             self._draw_manual_markers()
+            self._manual_view()
             self.ax_img.set_title(
                 f"手動トレース: {len(self.manual_pts)}点 "
                 f"(4点以上で曲率計算)")
@@ -956,6 +1003,7 @@ class App:
             self.result = None
             self.show_frame()
             self._draw_manual_markers()
+            self._manual_view()
             self._loupe_bg = None
             self.canvas.draw_idle()
             return
@@ -1352,9 +1400,10 @@ class App:
         sc = self.ax_img.scatter(res["x"][inc], res["y"][inc], c=v_disp[inc],
                                  cmap=cmap, s=7, vmin=vmin, vmax=vmax)
         label = "曲率半径" if is_r else "曲率"
-        # ビュー: 手動トレースは点群に合わせ、点も重畳。自動は ROI にズーム。
-        if self.manual_mode and self.manual_pts:
+        # ビュー: 手動トレースはフレーム全体を表示して点も重畳。自動は ROI にズーム。
+        if self.manual_mode:
             self._draw_manual_markers()
+            self._manual_view()
             self.ax_img.set_title(f"手動トレース {label}カラー  (R中央値="
                                   f"{self._Rmed_str()})")
         else:
