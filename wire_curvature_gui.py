@@ -296,6 +296,48 @@ def curvature_from_xy(x, y, smooth_scale=2.0, npts=300, closed=False):
                 closed=bool(closed))
 
 
+def fit_circle_kasa(x, y):
+    """点列に円を最小二乗フィット(Kåsa法, 代数的)。中心(cx,cy)・半径R・
+    RMS残差[px]を返す。3点以上必要。"""
+    x = np.asarray(x, float)
+    y = np.asarray(y, float)
+    A = np.c_[2 * x, 2 * y, np.ones(len(x))]
+    b = x * x + y * y
+    sol, *_ = np.linalg.lstsq(A, b, rcond=None)
+    cx, cy, c = sol
+    R = float(np.sqrt(max(c + cx * cx + cy * cy, 0.0)))
+    ri = np.hypot(x - cx, y - cy)
+    resid = float(np.sqrt(np.mean((ri - R) ** 2)))
+    return float(cx), float(cy), R, resid
+
+
+def circle_from_xy(x, y, npts=300, closed=False):
+    """点列に1個の円をフィットし、円弧を等間隔サンプリングした結果を返す。
+    曲率は一定 κ = ±1/R(符号は周回方向)。返り値は curvature_from_xy と
+    同じ形式 + center/R/resid/fit。円弧はクリック順(first→last)に沿って張る。"""
+    x = np.asarray(x, float)
+    y = np.asarray(y, float)
+    if len(x) < 3:
+        return None
+    cx, cy, R, resid = fit_circle_kasa(x, y)
+    if not np.isfinite(R) or R <= 0:
+        return None
+    th = np.unwrap(np.arctan2(y - cy, x - cx))   # クリック順に角度を連続化
+    if closed:
+        sign = 1.0 if (th[-1] - th[0]) >= 0 else -1.0
+        t = th[0] + sign * np.linspace(0.0, 2 * np.pi, npts)
+    else:
+        t = np.linspace(th[0], th[-1], npts)
+    xs = cx + R * np.cos(t)
+    ys = cy + R * np.sin(t)
+    s = np.r_[0, np.cumsum(np.hypot(np.diff(xs), np.diff(ys)))]
+    sgn = 1.0 if (t[-1] - t[0]) >= 0 else -1.0
+    kappa = np.full(npts, sgn / R)               # 一定曲率(符号付き)
+    return dict(x=xs, y=ys, kappa=kappa, s=s, total_len=s[-1],
+                closed=bool(closed), center=(cx, cy), R=R, resid=resid,
+                fit="circle")
+
+
 def curvature_of(mask, smooth_scale=2.0, npts=300):
     """マスク -> 中心線曲率。返り値 dict(x,y,kappa,s,total_len) 単位は px / 1/px"""
     sk = skeletonize(mask > 0)
@@ -475,12 +517,18 @@ class App:
             side="left", expand=True, fill="x", padx=(0, 2))
         ttk.Button(mrf, text="全消去", command=self.manual_clear).pack(
             side="left", expand=True, fill="x", padx=(2, 0))
+        self.v_circle = tk.BooleanVar(value=False)
+        ttk.Checkbutton(
+            mb, text="円フィット(一定曲率: 円弧の半径Rを測る)",
+            variable=self.v_circle,
+            command=self._manual_analyze).grid(
+            row=2, column=0, columnspan=2, sticky="w")
         self.v_manual_closed = tk.BooleanVar(value=False)
-        ttk.Checkbutton(mb, text="閉じる(周期スプライン=一周ループ)",
+        ttk.Checkbutton(mb, text="閉じる(周期/全円=一周ループ)",
                         variable=self.v_manual_closed,
                         command=self._manual_analyze).grid(
-            row=2, column=0, columnspan=2, sticky="w")
-        hf = ttk.Frame(mb); hf.grid(row=3, column=0, columnspan=2, sticky="ew",
+            row=3, column=0, columnspan=2, sticky="w")
+        hf = ttk.Frame(mb); hf.grid(row=4, column=0, columnspan=2, sticky="ew",
                                     pady=(4, 0))
         ttk.Label(hf, text="なめらかさ").pack(side="left")
         ttk.Scale(hf, from_=100, to=8000, orient="horizontal",
@@ -1057,25 +1105,30 @@ class App:
                          zorder=8)
 
     def _manual_analyze(self):
-        """手動点列から曲率を計算して描画。4点未満なら点だけ表示。"""
+        """手動点列から曲率を計算して描画。円フィット時は3点、スプライン時は4点必要。"""
         if not self.manual_mode:
             return
-        if len(self.manual_pts) < 4:
+        use_circle = self.v_circle.get()
+        need = 3 if use_circle else 4
+        if len(self.manual_pts) < need:
             self.result = None
             self.show_frame()
             self._draw_manual_markers()
             self._manual_view()
+            mode = "円フィット" if use_circle else "手動トレース"
             self.ax_img.set_title(
-                f"手動トレース: {len(self.manual_pts)}点 "
-                f"(4点以上で曲率計算)")
+                f"{mode}: {len(self.manual_pts)}点 ({need}点以上で計算)")
             self._loupe_bg = None
             self.canvas.draw_idle()
             return
         xs = np.array([p[0] for p in self.manual_pts])
         ys = np.array([p[1] for p in self.manual_pts])
-        res = curvature_from_xy(xs, ys,
-                                smooth_scale=self.v_smooth.get() / 1000.0,
-                                closed=self.v_manual_closed.get())
+        if use_circle:
+            res = circle_from_xy(xs, ys, closed=self.v_manual_closed.get())
+        else:
+            res = curvature_from_xy(xs, ys,
+                                    smooth_scale=self.v_smooth.get() / 1000.0,
+                                    closed=self.v_manual_closed.get())
         if res is None:
             self.result = None
             self.show_frame()
@@ -1480,9 +1533,19 @@ class App:
         label = "曲率半径" if is_r else "曲率"
         # ビュー: 手動トレースはフレーム全体を表示して点も重畳。自動は ROI にズーム。
         if self.manual_mode:
+            # 円フィット時はフィットした円と中心を薄く重ねる(視覚確認用)
+            if res.get("center") is not None:
+                cx, cy = res["center"]
+                tt = np.linspace(0, 2 * np.pi, 240)
+                self.ax_img.plot(cx + res["R"] * np.cos(tt),
+                                 cy + res["R"] * np.sin(tt),
+                                 ":", color="#0af", lw=1.0, zorder=6)
+                self.ax_img.plot([cx], [cy], "+", color="#0af", ms=11, mew=1.5,
+                                 zorder=6)
             self._draw_manual_markers()
             self._manual_view()
-            self.ax_img.set_title(f"手動トレース {label}カラー  (R中央値="
+            head = "円フィット" if res.get("fit") == "circle" else "手動トレース"
+            self.ax_img.set_title(f"{head} {label}カラー  (R中央値="
                                   f"{self._Rmed_str()})")
         else:
             x0, y0, x1, y1 = self.roi
@@ -1616,6 +1679,14 @@ class App:
         seg_len = float(s_inc[-1] - s_inc[0])
         trimmed = self.s_lo_frac > 0 or self.s_hi_frac < 1
         lines = [f"[フレーム {self.cur_index}]"]
+        if res.get("fit") == "circle":
+            R = res["R"]; resid = res["resid"]
+            if self.px_per_mm:
+                lines.append(f" 円フィット: R={R/self.px_per_mm:.2f} mm "
+                             f"残差={resid/self.px_per_mm:.3f} mm")
+            else:
+                lines.append(f" 円フィット: R={R:.1f} px 残差={resid:.2f} px "
+                             f"(要校正)")
         if trimmed:
             lines.append(f" 採用範囲: {self.s_lo_frac*100:.0f}–"
                          f"{self.s_hi_frac*100:.0f}% (端ノイズ除外)")
