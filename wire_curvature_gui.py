@@ -339,6 +339,11 @@ class App:
         self._frame_job = None
         self._pending_frame = 0
 
+        # マウスホイールによるズーム状態(カーソル中心)。None=全体/既定ビュー
+        self._user_view = None       # (x0, x1, y0, y1) データ座標
+
+
+
         # 校正ルーペ(2点クリック時にカーソル周辺を拡大表示する拡大鏡)
         self._loupe_ax = None       # 拡大表示用インセット軸
         self._loupe_im = None       # 拡大画像 AxesImage
@@ -629,6 +634,8 @@ class App:
         self.canvas.mpl_connect("button_press_event", self._on_trim_press)
         self.canvas.mpl_connect("motion_notify_event", self._on_trim_motion)
         self.canvas.mpl_connect("button_release_event", self._on_trim_release)
+        # マウスホイールで画像をカーソル中心に拡大縮小
+        self.canvas.mpl_connect("scroll_event", self._on_scroll)
         # 実際の軸配置(縦並び/横並び)を構築
         self._layout_axes()
 
@@ -735,6 +742,7 @@ class App:
         self.cur_index = 0
         self.fps = 1.0
         self.result = None
+        self._user_view = None                      # ズームを解除
         self.s_lo_frac, self.s_hi_frac = 0.0, 1.0   # トリムを全域にリセット
         self.lbl_file.config(text=os.path.basename(path))
         self.s_frame.config(to=0)          # 静止画なのでスライダは無効(1枚)
@@ -760,6 +768,7 @@ class App:
             return
         self.cap = cap
         self.video_path = path
+        self._user_view = None                      # ズームを解除
         self.s_lo_frac, self.s_hi_frac = 0.0, 1.0   # トリムを全域にリセット
         self.nframes = int(cap.get(cv2.CAP_PROP_FRAME_COUNT))
         self.fps = cap.get(cv2.CAP_PROP_FPS) or 30.0
@@ -842,8 +851,10 @@ class App:
             return
         H, W = self.frame.shape[:2]
         self.roi = (0, 0, W, H)
+        self._user_view = None            # ズームも解除して全体表示に
         self._draw_roi_rect()
         self._log("ROIを画像全体にリセットしました")
+        self.show_frame()
         self.update_preview()
 
     def _draw_roi_rect(self):
@@ -960,10 +971,76 @@ class App:
         self.result = None
         self._manual_analyze()
 
-    def _manual_view(self):
-        """手動トレース時の画像ビュー = フレーム全体(点群に追従してズームしない)。
-        全体が見えていればワイヤのどこでもクリックできる。"""
+    # -- ホイールズーム(カーソル中心) -------------------------------
+    def _on_scroll(self, ev):
+        """マウスホイールで ax_img をカーソル位置中心に拡大/縮小。
+        上=拡大, 下=縮小。全体まで縮小したら既定ビュー(自動)に戻す。"""
+        if self.frame is None or ev.inaxes != self.ax_img or ev.xdata is None:
+            return
+        base = 1.25
+        scale = 1.0 / base if ev.button == "up" else base
+        x0, x1 = self.ax_img.get_xlim()
+        y0, y1 = self.ax_img.get_ylim()
+        xd, yd = ev.xdata, ev.ydata
+        nx0 = xd - (xd - x0) * scale
+        nx1 = xd + (x1 - xd) * scale
+        ny0 = yd - (yd - y0) * scale
+        ny1 = yd + (y1 - yd) * scale
+        view = self._clamp_view(nx0, nx1, ny0, ny1)
+        if view is None:
+            self._reset_view()
+            return
+        self._user_view = view
+        self.ax_img.set_xlim(view[0], view[1])
+        self.ax_img.set_ylim(view[2], view[3])
+        self.canvas.draw_idle()
+
+    def _clamp_view(self, x0, x1, y0, y1):
+        """ビューをフレーム内に収める。フレーム全体以上に広げたら None(=全体表示)。"""
+        H, W = self.frame.shape[:2]
+        fxlo, fxhi, fylo, fyhi = -0.5, W - 0.5, -0.5, H - 0.5
+        fw, fh = fxhi - fxlo, fyhi - fylo
+        xlo, xhi = min(x0, x1), max(x0, x1)
+        ylo, yhi = min(y0, y1), max(y0, y1)
+        vw, vh = xhi - xlo, yhi - ylo
+        if vw >= fw and vh >= fh:
+            return None
+        vw, vh = min(vw, fw), min(vh, fh)
+        xlo = min(max(xlo, fxlo), fxhi - vw)
+        ylo = min(max(ylo, fylo), fyhi - vh)
+        # y は画像なので反転表示(下=大きい値)
+        return (xlo, xlo + vw, ylo + vh, ylo)
+
+    def _apply_user_view(self):
+        """ユーザーがズームしていれば、その範囲を ax_img に適用する。"""
+        if self._user_view is not None and self.frame is not None:
+            self.ax_img.set_xlim(self._user_view[0], self._user_view[1])
+            self.ax_img.set_ylim(self._user_view[2], self._user_view[3])
+            return True
+        return False
+
+    def _reset_view(self):
+        """ホイールズームを解除して、モード既定のビューに戻す。"""
+        self._user_view = None
         if self.frame is None:
+            return
+        if self.manual_mode:
+            self._manual_view()
+        elif self.roi:
+            x0, y0, x1, y1 = self.roi
+            self.ax_img.set_xlim(x0 - 10, x1 + 10)
+            self.ax_img.set_ylim(y1 + 10, y0 - 10)
+        else:
+            H, W = self.frame.shape[:2]
+            self.ax_img.set_xlim(-0.5, W - 0.5)
+            self.ax_img.set_ylim(H - 0.5, -0.5)
+        self.canvas.draw_idle()
+
+    def _manual_view(self):
+        """手動トレース時の画像ビュー。ズーム中はそれを優先、無ければフレーム全体。"""
+        if self.frame is None:
+            return
+        if self._apply_user_view():
             return
         H, W = self.frame.shape[:2]
         self.ax_img.set_xlim(-0.5, W - 0.5)
@@ -1271,6 +1348,7 @@ class App:
             self.cax.cla()
             self.cax.set_visible(False)
         self._draw_roi_rect()
+        self._apply_user_view()       # ホイールズーム中はその範囲を維持
         self.canvas.draw_idle()
 
     def analyze(self):
@@ -1413,6 +1491,7 @@ class App:
             self.ax_img.set_title(f"中心線 {label}カラー  (R中央値="
                                   f"{self._Rmed_str()})")
             self._draw_roi_rect()
+        self._apply_user_view()       # ホイールズーム中はその範囲を維持
         # 固定枠(cax)にカラーバーを描き直す。ax_img のサイズは変わらない
         self.cax.set_visible(True)
         self.cax.cla()
